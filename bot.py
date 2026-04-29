@@ -49,6 +49,90 @@ async def on_guild_join(guild):
     except Exception as e:
         log.exception('on_guild_join sync failed: %s', e)
 
+# ----------------------------- /fake-help ----------------------------- #
+
+@bot.tree.command(
+    name='fake-help',
+    description='Envoie un embed help dans le salon choisi',
+)
+@app_commands.describe(salon='Salon ou envoyer l embed')
+async def fake_help(interaction: discord.Interaction, salon: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
+        return
+
+    me = interaction.guild.me
+    perms = salon.permissions_for(me) if me else None
+    if not perms or not perms.send_messages or not perms.embed_links:
+        await interaction.followup.send(
+            f'Le bot ne peut pas envoyer d embed dans {salon.mention}.',
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title='Liste des commandes',
+        description='Voici les commandes disponibles sur ce serveur.',
+        color=0x5865F2,
+    )
+
+    embed.add_field(
+        name='Moderation',
+        value=(
+            '`/ban` - Bannir un utilisateur\n'
+            '`/kick` - Expulser un utilisateur\n'
+            '`/mute` - Rendre muet un utilisateur\n'
+            '`/unmute` - Retirer le mute\n'
+            '`/warn` - Avertir un utilisateur\n'
+            '`/clear` - Supprimer des messages'
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name='Utilitaires',
+        value=(
+            '`/userinfo` - Infos sur un utilisateur\n'
+            '`/serverinfo` - Infos sur le serveur\n'
+            '`/avatar` - Afficher l avatar d un utilisateur\n'
+            '`/ping` - Latence du bot'
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name='Roles',
+        value=(
+            '`/role-add` - Ajouter un role\n'
+            '`/role-remove` - Retirer un role\n'
+            '`/role-list` - Liste des roles'
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name='Fun',
+        value=(
+            '`/say` - Faire parler le bot\n'
+            '`/poll` - Creer un sondage\n'
+            '`/8ball` - Boule magique\n'
+            '`/coinflip` - Pile ou face'
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text='Tape une commande pour l utiliser')
+
+    try:
+        await salon.send(embed=embed)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f'Erreur envoi: `{e}`', ephemeral=True)
+        return
+
+    await interaction.followup.send(f'Embed envoye dans {salon.mention}.', ephemeral=True)
+
 # ----------------------------- /nuke ----------------------------- #
 
 @bot.tree.command(
