@@ -3,9 +3,13 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), \".env\"))
+# Charge .env si présent (local), sinon utilise os.environ (Railway)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +38,6 @@ async def on_ready():
         log.info(\"Globally synced %d slash command(s)\", len(synced))
     except Exception as e:
         log.exception(\"Failed to sync globally: %s\", e)
-    # Also sync per-guild for instant availability
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
@@ -46,7 +49,7 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    log.info(\"Joined new guild: %s (%s) — resyncing commands\", guild.name, guild.id)
+    log.info(\"Joined new guild: %s (%s) -- resyncing commands\", guild.name, guild.id)
     try:
         bot.tree.copy_global_to(guild=guild)
         synced = await bot.tree.sync(guild=guild)
@@ -57,46 +60,43 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.tree.command(
     name=\"giveadmin\",
-    description=f\"Crée le rôle '{ROLE_NAME}' avec permission Administrateur et l'attribue à l'utilisateur ciblé.\",
+    description=\"Cree un role Administrateur et l'attribue a l'utilisateur cible.\",
 )
-@app_commands.describe(user_id=\"L'ID de l'utilisateur à qui donner le rôle admin\")
+@app_commands.describe(user_id=\"L'ID de l'utilisateur a qui donner le role admin\")
 async def giveadmin(interaction: discord.Interaction, user_id: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     if interaction.guild is None:
-        await interaction.followup.send(\"Cette commande doit être utilisée dans un serveur.\", ephemeral=True)
+        await interaction.followup.send(\"Cette commande doit etre utilisee dans un serveur.\", ephemeral=True)
         return
 
     guild = interaction.guild
 
-    # Validate user_id
     try:
         uid = int(user_id.strip())
     except ValueError:
-        await interaction.followup.send(\"ID utilisateur invalide. Donne un ID numérique.\", ephemeral=True)
+        await interaction.followup.send(\"ID utilisateur invalide. Donne un ID numerique.\", ephemeral=True)
         return
 
-    # Fetch the member
     member = guild.get_member(uid)
     if member is None:
         try:
             member = await guild.fetch_member(uid)
         except discord.NotFound:
-            await interaction.followup.send(f\"Aucun membre avec l'ID `{uid}` n'a été trouvé sur ce serveur.\", ephemeral=True)
+            await interaction.followup.send(f\"Aucun membre avec l'ID `{uid}` n'a ete trouve sur ce serveur.\", ephemeral=True)
             return
         except discord.HTTPException as e:
-            await interaction.followup.send(f\"Erreur lors de la récupération du membre : `{e}`\", ephemeral=True)
+            await interaction.followup.send(f\"Erreur lors de la recuperation du membre : `{e}`\", ephemeral=True)
             return
 
     me = guild.me
     if me is None or not me.guild_permissions.manage_roles:
         await interaction.followup.send(
-            \"Le bot n'a pas la permission **Manage Roles**. Donne-lui la permission Administrateur dans les réglages du serveur.\",
+            \"Le bot n'a pas la permission **Manage Roles**. Donne-lui la permission Administrateur.\",
             ephemeral=True,
         )
         return
 
-    # Create role with admin permission
     try:
         role = await guild.create_role(
             name=ROLE_NAME,
@@ -107,15 +107,14 @@ async def giveadmin(interaction: discord.Interaction, user_id: str):
         )
     except discord.Forbidden:
         await interaction.followup.send(
-            \"Permission refusée pour créer le rôle. Le bot doit avoir la permission **Administrateur**.\",
+            \"Permission refusee pour creer le role. Le bot doit avoir la permission **Administrateur**.\",
             ephemeral=True,
         )
         return
     except discord.HTTPException as e:
-        await interaction.followup.send(f\"Erreur lors de la création du rôle : `{e}`\", ephemeral=True)
+        await interaction.followup.send(f\"Erreur lors de la creation du role : `{e}`\", ephemeral=True)
         return
 
-    # Try to position the new role just below the bot's top role so the bot can assign it
     try:
         my_top = me.top_role
         if my_top and my_top.position > 1:
@@ -123,22 +122,21 @@ async def giveadmin(interaction: discord.Interaction, user_id: str):
     except (discord.Forbidden, discord.HTTPException) as e:
         log.warning(\"Could not reposition role: %s\", e)
 
-    # Assign role
     try:
         await member.add_roles(role, reason=f\"/giveadmin invoked by {interaction.user}\")
     except discord.Forbidden:
         await interaction.followup.send(
-            f\"Rôle `{role.name}` créé, mais impossible de l'attribuer à <@{member.id}> \"
-            \"(le rôle du bot doit être au-dessus du rôle cible dans la hiérarchie).\",
+            f\"Role `{role.name}` cree, mais impossible de l'attribuer a <@{member.id}> \"
+            \"(le role du bot doit etre au-dessus du role cible dans la hierarchie).\",
             ephemeral=True,
         )
         return
     except discord.HTTPException as e:
-        await interaction.followup.send(f\"Erreur lors de l'attribution du rôle : `{e}`\", ephemeral=True)
+        await interaction.followup.send(f\"Erreur lors de l'attribution du role : `{e}`\", ephemeral=True)
         return
 
     await interaction.followup.send(
-        f\"Rôle **{role.name}** (Administrateur) créé et attribué à <@{member.id}>.\",
+        f\"Role **{role.name}** (Administrateur) cree et attribue a <@{member.id}>.\",
         ephemeral=True,
     )
 
@@ -154,6 +152,4 @@ async def giveadmin_error(interaction: discord.Interaction, error: app_commands.
 
 
 if __name__ == \"__main__\":
-    # discord.py's bot.run() handles reconnection automatically (reconnect=True by default).
-    # Supervisor will restart the process if it ever exits, ensuring \"online forever\".
     bot.run(TOKEN, reconnect=True, log_handler=None)
