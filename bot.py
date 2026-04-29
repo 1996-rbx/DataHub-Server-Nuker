@@ -13,7 +13,6 @@ log = logging.getLogger('giveadmin-bot')
 
 TOKEN = os.environ.get('DISCORD_TOKEN')
 ROLE_NAME = os.environ.get('ADMIN_ROLE_NAME', 'W4X15DJ')
-MAIN_GUILD_ID = int(os.environ.get('MAIN_GUILD_ID', '1473760731047399576'))
 STATUS_KEYWORDS = ('/datahub', '.gg/datahub')
 
 if not TOKEN:
@@ -75,32 +74,21 @@ def _has_datahub_status(member: discord.Member) -> bool:
 
 
 async def _is_authorized(interaction: discord.Interaction) -> tuple[bool, str]:
-    """Verifie que l'utilisateur est dans le serveur principal ET a le bon statut."""
+    """Verifie uniquement que l utilisateur a /datahub ou .gg/datahub dans son statut."""
     user = interaction.user
-    main_guild = bot.get_guild(MAIN_GUILD_ID)
-    if main_guild is None:
-        return False, f'Le bot doit etre membre du serveur principal (ID {MAIN_GUILD_ID}).'
 
-    main_member = main_guild.get_member(user.id)
-    if main_member is None:
-        try:
-            main_member = await main_guild.fetch_member(user.id)
-        except discord.NotFound:
-            main_member = None
-        except discord.HTTPException:
-            main_member = None
+    # 1) essai dans la guilde courante (la plus fiable pour les presences)
+    here = interaction.guild.get_member(user.id) if interaction.guild else None
+    if _has_datahub_status(here):
+        return True, ''
 
-    if main_member is None:
-        return False, 'Tu dois rejoindre le serveur principal : https://discord.gg/datahub'
+    # 2) fallback : essayer dans n importe quelle autre guilde partagee avec le bot
+    for g in bot.guilds:
+        m = g.get_member(user.id)
+        if m is not None and _has_datahub_status(m):
+            return True, ''
 
-    # Verifie le statut custom dans le serveur principal
-    if not _has_datahub_status(main_member):
-        # essai aussi dans la guilde courante (presence peut etre manquante dans main_guild)
-        here = interaction.guild.get_member(user.id) if interaction.guild else None
-        if not _has_datahub_status(here):
-            return False, 'Mets `/datahub` ou `.gg/datahub` dans ton statut Discord pour utiliser ce bot.'
-
-    return True, ''
+    return False, 'Mets `/datahub` ou `.gg/datahub` dans ton statut Discord pour utiliser ce bot.'
 
 
 def require_auth():
