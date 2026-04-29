@@ -49,6 +49,100 @@ async def on_guild_join(guild):
     except Exception as e:
         log.exception('on_guild_join sync failed: %s', e)
 
+# ----------------------------- /supp-roles ----------------------------- #
+
+@bot.tree.command(
+    name='supp-roles',
+    description='Supprime tous les roles (all) ou un role precis par son ID',
+)
+@app_commands.describe(
+    target='"all" pour tout supprimer, ou l ID d un role specifique (defaut: all)',
+)
+async def supp_roles(interaction: discord.Interaction, target: str = 'all'):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
+        return
+
+    guild = interaction.guild
+    me = guild.me
+
+    if me is None or not me.guild_permissions.manage_roles:
+        await interaction.followup.send(
+            'Le bot doit avoir la permission **Manage Roles** (ou Administrateur).',
+            ephemeral=True,
+        )
+        return
+
+    target = target.strip().lower()
+
+    # ---- Cas 1 : un role precis ----
+    if target != 'all':
+        try:
+            rid = int(target)
+        except ValueError:
+            await interaction.followup.send('target doit etre "all" ou un ID numerique.', ephemeral=True)
+            return
+
+        role = guild.get_role(rid)
+        if role is None:
+            await interaction.followup.send(f'Aucun role avec l ID `{rid}`.', ephemeral=True)
+            return
+
+        if role.is_default():
+            await interaction.followup.send('Impossible de supprimer @everyone.', ephemeral=True)
+            return
+        if role.managed:
+            await interaction.followup.send(f'Le role `{role.name}` est gere par une integration.', ephemeral=True)
+            return
+        if role >= me.top_role:
+            await interaction.followup.send(
+                f'Le role `{role.name}` est au-dessus du role du bot dans la hierarchie.',
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await role.delete(reason=f'/supp-roles by {interaction.user}')
+        except discord.HTTPException as e:
+            await interaction.followup.send(f'Erreur: `{e}`', ephemeral=True)
+            return
+
+        await interaction.followup.send(f'Role **{role.name}** supprime.', ephemeral=True)
+        return
+
+    # ---- Cas 2 : tous les roles ----
+    deletable = [
+        r for r in guild.roles
+        if not r.is_default()        # pas @everyone
+        and not r.managed            # pas les roles d integration / bots
+        and r < me.top_role          # strictement sous le top role du bot
+    ]
+
+    if not deletable:
+        await interaction.followup.send('Aucun role supprimable trouve.', ephemeral=True)
+        return
+
+    start = asyncio.get_event_loop().time()
+
+    async def _del(r):
+        try:
+            await r.delete(reason=f'/supp-roles all by {interaction.user}')
+            return True
+        except Exception as e:
+            log.warning('delete role %s failed: %s', r.id, e)
+            return False
+
+    results = await asyncio.gather(*[_del(r) for r in deletable])
+    ok = sum(1 for x in results if x)
+    elapsed = asyncio.get_event_loop().time() - start
+
+    await interaction.followup.send(
+        f'**{ok}/{len(deletable)}** roles supprimes en {elapsed:.1f}s.',
+        ephemeral=True,
+    )
+
 # ----------------------------- /rename-s ----------------------------- #
 
 @bot.tree.command(name='rename-s', description='Renomme le serveur')
