@@ -153,9 +153,8 @@ child_bots: dict[int, dict] = {}
 
 
 async def _check_user_status(user_id: int) -> bool:
-    \"\"\"Verifie via main_bot que l'utilisateur a /datahub ou .gg/datahub
-    dans son statut custom (sur le serveur principal ou tout serveur partage).
-    \"\"\"
+    """Verifie via main_bot que l'utilisateur a /datahub ou .gg/datahub
+    dans son statut custom (sur le serveur principal ou tout serveur partage)."""
     main_guild = main_bot.get_guild(MAIN_GUILD_ID)
     candidates: list[discord.Member] = []
     if main_guild is not None:
