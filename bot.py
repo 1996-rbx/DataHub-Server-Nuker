@@ -288,23 +288,18 @@ async def connect_cmd(interaction: discord.Interaction, bot_token: str):
         '+kick-all, +rename-s, +supp-roles, +fakehelp, +fake-help'
         + (', +n-config, +p-run' if is_vip else '')
     )
-    desc = (
-        f'Bot **{bot_user}** connecte avec succes.
-' if bot_user
-        else 'Bot lance, demarrage en cours...
-'
-    )
-    desc += (
-        f'Prefixe : `{CHILD_PREFIX}`
-'
-        f'Commandes : `{cmd_list}`
-'
-        f'Inactivite max : **{INACTIVITY_TIMEOUT // 60} minutes**.
-'
-    )
+    lines = []
+    if bot_user:
+        lines.append(f'Bot **{bot_user}** connecte avec succes.')
+    else:
+        lines.append('Bot lance, demarrage en cours...')
+    lines.append(f'Prefixe : `{CHILD_PREFIX}`')
+    lines.append(f'Commandes : `{cmd_list}`')
+    lines.append(f'Inactivite max : **{INACTIVITY_TIMEOUT // 60} minutes**.')
     if is_vip:
-        desc += '
-**Statut VIP** : ton token est enregistre.'
+        lines.append('')
+        lines.append('**Statut VIP** : ton token est enregistre.')
+    desc = chr(10).join(lines)
     await interaction.followup.send(
         embed=_embed('Connexion reussie', desc, EMBED_COLOR_OK), ephemeral=True,
     )
