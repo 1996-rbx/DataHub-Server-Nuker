@@ -982,20 +982,10 @@ def _register_child_commands(bot: commands.Bot) -> None:
             is_vip = await _check_user_vip(ctx.author.id)
             await ctx.send(embed=_build_real_help_embed(bot, is_vip=is_vip))
 
-        @bot.command(name='help')
-    async def help_cmd(ctx: commands.Context):
-        gid = ctx.guild.id if ctx.guild else 0
-        if bot._fake_help_mode.get(gid, False):  # type: ignore[attr-defined]
-            await ctx.send(embed=_build_fake_help_embed())
-        else:
-            is_vip = await _check_user_vip(ctx.author.id)
-            await ctx.send(embed=_build_real_help_embed(bot, is_vip=is_vip))
-
     @bot.command(name='disconnect')
     @require_auth()
     async def disconnect_cmd(ctx: commands.Context):
         owner_id = bot._owner_id  # type: ignore[attr-defined]
-        # Seul le proprietaire (celui qui a fait /connect) peut couper son bot
         if ctx.author.id != owner_id:
             await ctx.send(embed=_bad(
                 'Acces refuse',
@@ -1004,7 +994,6 @@ def _register_child_commands(bot: commands.Bot) -> None:
             return
         rec = child_bots.get(owner_id)
         is_vip = bool(rec and rec.get('is_vip'))
-        # Si VIP, supprime aussi le token sauvegarde pour ne pas auto-reconnect
         token_removed = False
         if is_vip:
             token_removed = _del_vip_token(owner_id)
@@ -1029,7 +1018,6 @@ def _register_child_commands(bot: commands.Bot) -> None:
             await ctx.send(embed=embed)
         except Exception:  # noqa: BLE001
             pass
-        # On lance le stop en background pour que le message ait le temps de partir
         asyncio.create_task(_stop_child_bot(owner_id, reason='manual disconnect'))
 
     @bot.command(name='fakehelp')
