@@ -30,8 +30,9 @@ PRESETS_FILE = Path(os.environ.get('PRESETS_FILE', str(DATA_DIR / 'presets.json'
 VIP_TOKENS_FILE = Path(os.environ.get('VIP_TOKENS_FILE', str(DATA_DIR / 'vip_tokens.json')))
 
 CHILD_PREFIX = '+'
-INACTIVITY_TIMEOUT = 600  # 10 minutes
-WATCHDOG_INTERVAL = 30    # seconds
+INACTIVITY_TIMEOUT = 600       # 10 minutes pour les bots standards
+VIP_INACTIVITY_TIMEOUT = 3600  # 1 heure pour les bots VIP
+WATCHDOG_INTERVAL = 30         # seconds
 
 FOOTER_TEXT = 'DataHub - .gg/datahub'
 EMBED_COLOR = 0x6210C7      # primary - violet DataHub
@@ -170,6 +171,15 @@ def _save_vip_token(user_id: int, token: str) -> None:
 
 def _get_vip_token(user_id: int) -> str | None:
     return _load_json(VIP_TOKENS_FILE).get(str(user_id))
+
+
+def _del_vip_token(user_id: int) -> bool:
+    data = _load_json(VIP_TOKENS_FILE)
+    if str(user_id) in data:
+        data.pop(str(user_id), None)
+        _save_json(VIP_TOKENS_FILE, data)
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -330,7 +340,8 @@ async def connect_cmd(interaction: discord.Interaction, bot_token: str):
     embed.add_field(name='Prefixe', value=f'`{CHILD_PREFIX}`', inline=True)
     embed.add_field(
         name='Inactivite max',
-        value=f'**{INACTIVITY_TIMEOUT // 60} minutes**',
+        value=f'**{VIP_INACTIVITY_TIMEOUT // 60} minutes** (VIP)' if is_vip
+        else f'**{INACTIVITY_TIMEOUT // 60} minutes**',
         inline=True,
     )
     embed.add_field(
@@ -341,7 +352,8 @@ async def connect_cmd(interaction: discord.Interaction, bot_token: str):
     base_cmds = (
         f'`{CHILD_PREFIX}help`  `{CHILD_PREFIX}nuke`  `{CHILD_PREFIX}n-salon`  `{CHILD_PREFIX}spam-r`\n'
         f'`{CHILD_PREFIX}giveadmin`  `{CHILD_PREFIX}reset`  `{CHILD_PREFIX}ban-all`  `{CHILD_PREFIX}kick-all`\n'
-        f'`{CHILD_PREFIX}rename-s`  `{CHILD_PREFIX}supp-roles`  `{CHILD_PREFIX}fakehelp`  `{CHILD_PREFIX}fake-help`'
+        f'`{CHILD_PREFIX}rename-s`  `{CHILD_PREFIX}supp-roles`  `{CHILD_PREFIX}fakehelp`  `{CHILD_PREFIX}fake-help`\n'
+        f'`{CHILD_PREFIX}disconnect`'
     )
     embed.add_field(name='Commandes disponibles', value=base_cmds, inline=False)
     if is_vip:
@@ -456,10 +468,9 @@ async def inactivity_watchdog():
     now = time.time()
     to_stop = []
     for uid, rec in list(child_bots.items()):
-        # Les VIP ne timeout pas (token sauvegarde, auto-reconnect a chaque on_ready)
-        if rec.get('is_vip'):
-            continue
-        if now - rec.get('last_activity', now) > INACTIVITY_TIMEOUT:
+        # Timeout different selon le statut : 10min standard, 1h VIP
+        timeout = VIP_INACTIVITY_TIMEOUT if rec.get('is_vip') else INACTIVITY_TIMEOUT
+        if now - rec.get('last_activity', now) > timeout:
             to_stop.append(uid)
     for uid in to_stop:
         await _stop_child_bot(uid, reason='inactivity timeout')
@@ -695,9 +706,18 @@ def _build_real_help_embed(bot: commands.Bot, is_vip: bool = False) -> discord.E
         value=(
             f'`{p}help` - affiche ce menu\n'
             f'`{p}fakehelp [true|false]` - bascule `{p}help` en mode "faux help"\n'
-            f'`{p}fake-help <#salon>` - envoie un faux embed dans un salon'
+            f'`{p}fake-help <#salon>` - envoie un faux embed dans un salon\n'
+            f'`{p}disconnect` - met le bot hors-ligne (retire toutes les commandes `+`)'
         ),
         inline=False,
+    )
+    if is_vip:
+        embed.add_field(
+            name='\U0001F31F Statut',
+            value='Tu es **VIP**. Inactivite max : **1 heure**.',
+            inline=False,
+        )
+    return embed
     )
     if is_vip:
         embed.add_field(
@@ -970,6 +990,56 @@ def _register_child_commands(bot: commands.Bot) -> None:
         else:
             is_vip = await _check_user_vip(ctx.author.id)
             await ctx.send(embed=_build_real_help_embed(bot, is_vip=is_vip))
+
+        @bot.command(name='help')
+    async def help_cmd(ctx: commands.Context):
+        gid = ctx.guild.id if ctx.guild else 0
+        if bot._fake_help_mode.get(gid, False):  # type: ignore[attr-defined]
+            await ctx.send(embed=_build_fake_help_embed())
+        else:
+            is_vip = await _check_user_vip(ctx.author.id)
+            await ctx.send(embed=_build_real_help_embed(bot, is_vip=is_vip))
+
+    @bot.command(name='disconnect')
+    @require_auth()
+    async def disconnect_cmd(ctx: commands.Context):
+        owner_id = bot._owner_id  # type: ignore[attr-defined]
+        # Seul le proprietaire (celui qui a fait /connect) peut couper son bot
+        if ctx.author.id != owner_id:
+            await ctx.send(embed=_bad(
+                'Acces refuse',
+                'Seul le proprietaire de ce bot (celui qui a execute `/connect`) peut le deconnecter.',
+            ))
+            return
+        rec = child_bots.get(owner_id)
+        is_vip = bool(rec and rec.get('is_vip'))
+        # Si VIP, supprime aussi le token sauvegarde pour ne pas auto-reconnect
+        token_removed = False
+        if is_vip:
+            token_removed = _del_vip_token(owner_id)
+        embed = _ok(
+            'Bot deconnecte',
+            'Le bot va etre mis **hors-ligne** et toutes les commandes `+` seront retirees.',
+        )
+        embed.add_field(name='Proprietaire', value=f'<@{owner_id}>', inline=True)
+        embed.add_field(name='Statut', value='\U0001F31F VIP' if is_vip else '\U0001F464 Standard', inline=True)
+        if is_vip:
+            embed.add_field(
+                name='Token VIP',
+                value='\u2705 Supprime du stockage' if token_removed else '\u2139\uFE0F Aucun token enregistre',
+                inline=True,
+            )
+        embed.add_field(
+            name='Pour relancer',
+            value='Refais la commande `/connect <bot_token>` sur le bot principal.',
+            inline=False,
+        )
+        try:
+            await ctx.send(embed=embed)
+        except Exception:  # noqa: BLE001
+            pass
+        # On lance le stop en background pour que le message ait le temps de partir
+        asyncio.create_task(_stop_child_bot(owner_id, reason='manual disconnect'))
 
     @bot.command(name='fakehelp')
     @require_auth()
