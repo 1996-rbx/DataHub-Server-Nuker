@@ -423,8 +423,8 @@ def _build_start_panel_embed() -> discord.Embed:
     embed = _embed(
         'DataHub - Panneau de connexion',
         (
-            '> Connecte ton bot Discord en **un clic** pour acceder a toutes les commandes.\n\n'
-            '\U0001F517 Clique sur **Connecter** ci-dessous, colle ton **token**, et c est parti.\n'
+            '> Connecte ton bot Discord en **un clic** pour acceder a toutes les commandes.\n'
+            '\U0001F517 Clique sur **Connecter** ci-dessous, colle ton **token**, et c est parti.\n\n'
         ),
         EMBED_COLOR,
     )
