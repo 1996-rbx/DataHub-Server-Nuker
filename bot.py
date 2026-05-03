@@ -382,8 +382,6 @@ Trouve la fonction async def connect_cmd(...) et remplace son corps par cet appe
 async def connect_cmd(interaction: discord.Interaction, bot_token: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     await _do_connect_flow(interaction, bot_token)
-📋 Étape 2 — Ajoute le helper + modal + view + commande
-Colle ce bloc juste avant le commentaire # --- Child bot factory --- (ou n'importe où entre connect_cmd et _build_child_bot) :
 
 # --------------------------------------------------------------------------- #
 # Shared connect flow + Start Panel
